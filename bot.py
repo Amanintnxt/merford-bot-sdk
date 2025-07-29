@@ -36,6 +36,8 @@ adapter = BotFrameworkAdapter(adapter_settings)
 thread_map = {}
 access_token_cache = {"token": None, "expiry": 0}
 
+print(TENANT_ID, CLIENT_ID, CLIENT_SECRET)
+
 
 def get_graph_api_token():
     now = time.time()
