@@ -3,6 +3,7 @@ import time
 import openai
 import asyncio
 import logging
+import requests
 from dotenv import load_dotenv
 from flask import Flask, request, Response
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, TurnContext
@@ -11,12 +12,14 @@ from botbuilder.schema import Activity
 # Load environment variables
 load_dotenv()
 
-# Credentials and keys
+# Credentials
 APP_ID = os.getenv("MicrosoftAppId", "")
 APP_PASSWORD = os.getenv("MicrosoftAppPassword", "")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-ASSISTANT_ID = os.getenv("ASSISTANT_ID")
+TENANT_ID = os.getenv("TENANT_ID")
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
 # Configure OpenAI Azure API
 openai.api_type = "azure"
@@ -29,12 +32,71 @@ app = Flask(__name__)
 adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
 adapter = BotFrameworkAdapter(adapter_settings)
 
-# Simple memory store for user threads
+# Memory store
 thread_map = {}
+access_token_cache = {"token": None, "expiry": 0}
 
 
+def get_graph_api_token():
+    now = time.time()
+    if access_token_cache["token"] and now < access_token_cache["expiry"]:
+        return access_token_cache["token"]
+
+    url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    data = {
+        "client_id": CLIENT_ID,
+        "scope": "https://graph.microsoft.com/.default",
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "client_credentials"
+    }
+
+    response = requests.post(url, headers=headers, data=data)
+    if response.status_code != 200:
+        raise Exception(
+            f"Failed to get token: {response.status_code}, {response.text}")
+
+    token_data = response.json()
+    token = token_data["access_token"]
+    # default 30 min if missing
+    expires_in = token_data.get("expires_in", 1800)
+    access_token_cache["token"] = token
+    access_token_cache["expiry"] = now + \
+        expires_in - 60  # renew 1 min before expiry
+
+    return token
+
+
+#      Group Lookup Function    #
+def get_user_group_level(user_id):
+    access_token = get_graph_api_token()
+    url = f"https://graph.microsoft.com/v1.0/users/{user_id}/memberOf"
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        logging.warning(
+            f"Group lookup failed: {response.status_code} - {response.text}")
+        return None
+
+    groups = response.json().get("value", [])
+    for group in groups:
+        name = group.get("displayName")
+        if name == "Level1Access":
+            return "Level 1"
+        elif name == "Level2Access":
+            return "Level 2"
+        elif name == "Level3Access":
+            return "Level 3"
+        elif name == "Level4Access":
+            return "Level 4"
+
+    return None  # Not found
+
+
+#      Main Bot Handler         #
 async def handle_message(turn_context: TurnContext):
-    user_id = turn_context.activity.from_property.id
+    user_id = turn_context.activity.from_property.aad_object_id or turn_context.activity.from_property.id
     user_input = turn_context.activity.text
 
     if not user_input or not user_input.strip():
@@ -42,30 +104,38 @@ async def handle_message(turn_context: TurnContext):
         return
 
     try:
-        # Show typing indicator immediately
         await turn_context.send_activity(Activity(type="typing"))
 
-        # Get or create thread ID for user
+        # Resolve assistant by group
+        level = get_user_group_level(user_id)
+        assistant_map = {
+            "Level 1": "asst_6q2Ve7DWwrzh0m3n3sbOote",
+            "Level 2": "asst_BIOAPR48ztth4k79U4h0cPtu",
+            "Level 3": "asst_LSWGUNXMRQmzpjN1ItrU0zSX",
+            "Level 4": "asst_s1OefDDlgDVpgOgfp5pfCPv1"
+        }
+        assistant_id = assistant_map.get(level, os.getenv("ASSISTANT_ID"))
+
+        # Get or create thread
         thread_id = thread_map.get(user_id)
         if not thread_id:
             thread = openai.beta.threads.create()
             thread_id = thread.id
             thread_map[user_id] = thread_id
 
-        # Add user message to assistant thread
+        # Add user message
         openai.beta.threads.messages.create(
             thread_id=thread_id,
             role="user",
             content=user_input
         )
 
-        # Start a new assistant run
+        # Run assistant
         run = openai.beta.threads.runs.create(
-            assistant_id=ASSISTANT_ID,
+            assistant_id=assistant_id,
             thread_id=thread_id
         )
 
-        # Poll until run completes/fails/cancelled
         while run.status not in ["completed", "failed", "cancelled"]:
             time.sleep(1)
             run = openai.beta.threads.runs.retrieve(
@@ -73,12 +143,12 @@ async def handle_message(turn_context: TurnContext):
                 run_id=run.id
             )
 
-        # Get last assistant message from the thread messages
+        # Fetch reply
         messages = openai.beta.threads.messages.list(thread_id=thread_id)
         assistant_reply = None
-        for message in messages.data:
-            if message.role == "assistant":
-                assistant_reply = message.content[0].text.value
+        for msg in messages.data:
+            if msg.role == "assistant":
+                assistant_reply = msg.content[0].text.value
                 break
 
         if not assistant_reply:
@@ -88,7 +158,6 @@ async def handle_message(turn_context: TurnContext):
         logging.error(f"Error handling message: {e}")
         assistant_reply = "Something went wrong."
 
-    # Send the full reply after complete processing
     await turn_context.send_activity(Activity(
         type="message",
         text=assistant_reply,
@@ -99,6 +168,8 @@ async def handle_message(turn_context: TurnContext):
         service_url=turn_context.activity.service_url
     ))
 
+
+#       Flask Endpoints         #
 
 @app.route("/api/messages", methods=["POST"])
 def messages():
@@ -125,6 +196,7 @@ def health_check():
     return "Teams Bot is running."
 
 
+#       Run Flask Server        #
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     app.run(host="0.0.0.0", port=3978)
