@@ -36,8 +36,6 @@ adapter = BotFrameworkAdapter(adapter_settings)
 thread_map = {}
 access_token_cache = {"token": None, "expiry": 0}
 
-print(TENANT_ID, CLIENT_ID, CLIENT_SECRET)
-
 
 def get_graph_api_token():
     now = time.time()
@@ -65,7 +63,7 @@ def get_graph_api_token():
     access_token_cache["token"] = token
     access_token_cache["expiry"] = now + \
         expires_in - 60  # renew 1 min before expiry
-
+    print(token)
     return token
 
 
@@ -107,7 +105,7 @@ async def handle_message(turn_context: TurnContext):
 
     try:
         await turn_context.send_activity(Activity(type="typing"))
-
+        user_id = "a62bf818-86a9-4a27-80d3-b087ea19e3f8"
         # Resolve assistant by group
         level = get_user_group_level(user_id)
         assistant_map = {
