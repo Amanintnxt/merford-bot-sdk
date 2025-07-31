@@ -74,6 +74,7 @@ def get_user_group_level(user_id):
     headers = {"Authorization": f"Bearer {access_token}"}
 
     response = requests.get(url, headers=headers)
+
     if response.status_code != 200:
         logging.warning(
             f"Group lookup failed: {response.status_code} - {response.text}")
@@ -114,7 +115,7 @@ async def handle_message(turn_context: TurnContext):
             "Level 3": "asst_LSWGUNXMRQmzpjN1ItrU0zSX",
             "Level 4": "asst_s1OefDDlgDVpgOgfp5pfCPv1"
         }
-        assistant_id = assistant_map.get(level, os.getenv("ASSISTANT_ID"))
+        assistant_id = assistant_map.get('Level 4', os.getenv("ASSISTANT_ID"))
 
         # Get or create thread
         thread_id = thread_map.get(user_id)
