@@ -110,10 +110,10 @@ async def handle_message(turn_context: TurnContext):
         # Resolve assistant by group
         level = get_user_group_level(user_id)
         assistant_map = {
-            "Level 1": "asst_6q2Ve7DWwrzh0m3n3sbOote",
-            "Level 2": "asst_BIOAPR48ztth4k79U4h0cPtu",
-            "Level 3": "asst_LSWGUNXMRQmzpjN1ItrU0zSX",
-            "Level 4": "asst_s1OefDDlgDVpgOgfp5pfCPv1"
+            "Level 1": "asst_r6q2Ve7DDwrzh0m3n3sbOote",
+            "Level 2": "asst_BIOAPR48tzth4k79U4h0cPtu",
+            "Level 3": "asst_SLWGUNXMQrmzpJIN1trU0zSX",
+            "Level 4": "asst_s1OefDDIgDVpqOgfp5pfCpV1"
         }
         assistant_id = assistant_map.get('Level 4', os.getenv("ASSISTANT_ID"))
 
