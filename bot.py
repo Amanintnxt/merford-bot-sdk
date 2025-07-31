@@ -115,7 +115,7 @@ async def handle_message(turn_context: TurnContext):
             "Level 3": "asst_SLWGUNXMQrmzpJIN1trU0zSX",
             "Level 4": "asst_s1OefDDIgDVpqOgfp5pfCpV1"
         }
-        assistant_id = assistant_map.get('Level 4', os.getenv("ASSISTANT_ID"))
+        assistant_id = assistant_map.get('Level 1', os.getenv("ASSISTANT_ID"))
 
         # Get or create thread
         thread_id = thread_map.get(user_id)
