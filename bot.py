@@ -97,12 +97,21 @@ def get_user_group_level(user_id):
 
 #      Main Bot Handler         #
 async def handle_message(turn_context: TurnContext):
+    # Handle conversationUpdate event to send greeting once
+    if turn_context.activity.type == "conversationUpdate":
+        members_added = turn_context.activity.members_added
+        if members_added:
+            for member in members_added:
+                if member.id == turn_context.activity.recipient.id:
+                    await turn_context.send_activity("Hello! How can I assist you today?")
+        return
+
+    # Only handle non-empty 'message' activities
+    if turn_context.activity.type != "message" or not turn_context.activity.text or not turn_context.activity.text.strip():
+        return  # Ignore empty or whitespace messages
+
     user_id = turn_context.activity.from_property.aad_object_id or turn_context.activity.from_property.id
     user_input = turn_context.activity.text
-
-    if not user_input or not user_input.strip():
-        await turn_context.send_activity("Hello! How can I assist you today?")
-        return
 
     try:
         await turn_context.send_activity(Activity(type="typing"))
