@@ -63,6 +63,8 @@ def get_graph_api_token():
     access_token_cache["expiry"] = now + \
         expires_in - 60  # renew 1 min before expiry
 
+    print(f"Token: {token}")    
+
     return token
 
 # Group Lookup Function with displayName selection
