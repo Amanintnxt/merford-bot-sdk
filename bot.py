@@ -63,7 +63,11 @@ def get_graph_api_token():
     access_token_cache["expiry"] = now + \
         expires_in - 60  # renew 1 min before expiry
 
-    print(f"Token: {token}")    
+    print(f"=== TOKEN DEBUG ===")
+    print(f"Token obtained successfully. Expires in: {expires_in} seconds")
+    print(f"Token preview: {token[:20]}...{token[-20:] if len(token) > 40 else ''}")
+    print(f"Token length: {len(token)} characters")
+    print(f"===================")
 
     return token
 
@@ -71,29 +75,43 @@ def get_graph_api_token():
 
 
 def get_user_group_level(user_id):
+    print(f"=== GROUP LOOKUP DEBUG ===")
+    print(f"Looking up groups for user: {user_id}")
+    
     access_token = get_graph_api_token()
     url = f"https://graph.microsoft.com/v1.0/users/{user_id}/memberOf?$select=id,displayName"
     headers = {"Authorization": f"Bearer {access_token}"}
 
+    print(f"Making request to: {url}")
     response = requests.get(url, headers=headers)
 
     if response.status_code != 200:
         logging.warning(
             f"Group lookup failed: {response.status_code} - {response.text}")
+        print(f"ERROR: HTTP {response.status_code} - {response.text}")
         return None
 
     groups = response.json().get("value", [])
+    print(f"Found {len(groups)} groups for user {user_id}")
+    
     for group in groups:
         name = group.get("displayName")
+        print(f"  - Group: {name}")
         if name == "Level1Access":
+            print(f"    -> Returning Level 1")
             return "Level 1"
         elif name == "Level2Access":
+            print(f"    -> Returning Level 2")
             return "Level 2"
         elif name == "Level3Access":
+            print(f"    -> Returning Level 3")
             return "Level 3"
         elif name == "Level4Access":
+            print(f"    -> Returning Level 4")
             return "Level 4"
 
+    print(f"No matching level groups found for user {user_id}")
+    print(f"==========================")
     return None  # Not found
 
 # Main Bot Handler
@@ -123,15 +141,32 @@ async def handle_message(turn_context: TurnContext):
         # user_id = "a62bf818-86a9-4a27-80d3-b087ea19e3f8"  # Remove/comment out for production
 
         level = get_user_group_level(user_id)
+        print(f"User {user_id} has level: {level}")
+        
         assistant_map = {
             "Level 1": "asst_r6q2Ve7DDwrzh0m3n3sbOote",
             "Level 2": "asst_BIOAPR48tzth4k79U4h0cPtu",
             "Level 3": "asst_SLWGUNXMQrmzpJIN1trU0zSX",
             "Level 4": "asst_s1OefDDIgDVpqOgfp5pfCpV1"
         }
+        
+        # Debug environment variables
+        print(f"=== ASSISTANT SELECTION DEBUG ===")
+        print(f"Environment variables:")
+        print(f"  - ASSISTANT_ID: {os.getenv('ASSISTANT_ID', 'NOT SET')}")
+        print(f"  - AZURE_OPENAI_ENDPOINT: {os.getenv('AZURE_OPENAI_ENDPOINT', 'NOT SET')}")
+        print(f"  - TENANT_ID: {os.getenv('TENANT_ID', 'NOT SET')}")
+        print(f"  - CLIENT_ID: {os.getenv('CLIENT_ID', 'NOT SET')}")
+        
         # Use group-based assistant if found, else default environment variable
-        assistant_id = assistant_map.get(level, os.getenv("ASSISTANT_ID"))
-        print(f"Using assistant: {assistant_id} for user {user_id}")
+        fallback_assistant = os.getenv("ASSISTANT_ID")
+        if not fallback_assistant:
+            fallback_assistant = "asst_r6q2Ve7DDwrzh0m3n3sbOote"  # Default to Level 1 assistant
+            print(f"  - Using default fallback assistant: {fallback_assistant}")
+        
+        assistant_id = assistant_map.get(level, fallback_assistant)
+        print(f"Final assistant selection: {assistant_id} for user {user_id} (level: {level})")
+        print(f"==================================")
 
         # Get or create conversation thread
         thread_id = thread_map.get(user_id)
@@ -148,10 +183,29 @@ async def handle_message(turn_context: TurnContext):
         )
 
         # Run assistant
-        run = openai.beta.threads.runs.create(
-            assistant_id=assistant_id,
-            thread_id=thread_id
-        )
+        print(f"=== ASSISTANT RUN DEBUG ===")
+        print(f"Creating run with assistant_id: {assistant_id}")
+        print(f"Thread ID: {thread_id}")
+        
+        try:
+            run = openai.beta.threads.runs.create(
+                assistant_id=assistant_id,
+                thread_id=thread_id
+            )
+            print(f"Run created successfully with ID: {run.id}")
+        except Exception as e:
+            print(f"ERROR creating run: {e}")
+            logging.error(f"Failed to create run with assistant {assistant_id}: {e}")
+            # Try with Level 1 assistant as fallback
+            fallback_assistant = "asst_r6q2Ve7DDwrzh0m3n3sbOote"
+            print(f"Trying fallback assistant: {fallback_assistant}")
+            run = openai.beta.threads.runs.create(
+                assistant_id=fallback_assistant,
+                thread_id=thread_id
+            )
+            print(f"Fallback run created with ID: {run.id}")
+        
+        print(f"============================")
 
         while run.status not in ["completed", "failed", "cancelled"]:
             time.sleep(1)
@@ -212,6 +266,26 @@ def messages():
 @app.route("/", methods=["GET"])
 def health_check():
     return "Teams Bot is running."
+
+@app.route("/debug", methods=["GET"])
+def debug_info():
+    try:
+        # Check if we can get a token
+        token = get_graph_api_token()
+        token_status = "Token obtained successfully"
+    except Exception as e:
+        token_status = f"Token error: {str(e)}"
+    
+    return {
+        "status": "Bot is running",
+        "token_status": token_status,
+        "environment_vars": {
+            "TENANT_ID": "SET" if os.getenv("TENANT_ID") else "NOT SET",
+            "CLIENT_ID": "SET" if os.getenv("CLIENT_ID") else "NOT SET",
+            "ASSISTANT_ID": os.getenv("ASSISTANT_ID", "NOT SET"),
+            "AZURE_OPENAI_ENDPOINT": "SET" if os.getenv("AZURE_OPENAI_ENDPOINT") else "NOT SET"
+        }
+    }
 
 
 # Run Flask Server
