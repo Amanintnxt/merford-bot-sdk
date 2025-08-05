@@ -4,6 +4,7 @@ import openai
 import asyncio
 import logging
 import requests
+import msal
 from dotenv import load_dotenv
 from flask import Flask, request, Response
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, TurnContext
@@ -12,65 +13,64 @@ from botbuilder.schema import Activity
 # Load environment variables
 load_dotenv()
 
-# Credentials
+# Credentials and config
 APP_ID = os.getenv("MicrosoftAppId", "")
 APP_PASSWORD = os.getenv("MicrosoftAppPassword", "")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 TENANT_ID = os.getenv("TENANT_ID")
 CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
-# Configure OpenAI Azure API
+# MSAL setup for device code flow (public client, no client secret needed)
+AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+SCOPES = ["User.Read", "Directory.Read.All",
+          "Group.Read.All", "GroupMember.Read.All"]
+msal_app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
+
+# OpenAI config
 openai.api_type = "azure"
 openai.api_version = "2024-05-01-preview"
 openai.api_key = AZURE_OPENAI_API_KEY
 openai.azure_endpoint = AZURE_OPENAI_ENDPOINT.rstrip("/")
 
-# Flask & Bot setup
+# Flask & Bot Framework setup
 app = Flask(__name__)
 adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
 adapter = BotFrameworkAdapter(adapter_settings)
 
-# Memory store
+# Memory stores
 thread_map = {}
-access_token_cache = {"token": None, "expiry": 0}
+token_cache = {"token": None, "expiry": 0}
 
 
-def get_graph_api_token():
+def get_token_device_code_flow():
     now = time.time()
-    if access_token_cache["token"] and now < access_token_cache["expiry"]:
-        return access_token_cache["token"]
+    if token_cache["token"] and now < token_cache["expiry"]:
+        return token_cache["token"]
 
-    url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    data = {
-        "client_id": CLIENT_ID,
-        "scope": "https://graph.microsoft.com/.default",
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "client_credentials"
-    }
+    flow = msal_app.initiate_device_flow(scopes=SCOPES)
 
-    response = requests.post(url, headers=headers, data=data)
-    if response.status_code != 200:
-        raise Exception(
-            f"Failed to get token: {response.status_code}, {response.text}")
+    if "user_code" not in flow:
+        raise Exception("Failed to initiate device flow: " + str(flow))
 
-    token_data = response.json()
-    token = token_data["access_token"]
-    # default 30 min if missing
-    expires_in = token_data.get("expires_in", 1800)
-    access_token_cache["token"] = token
-    access_token_cache["expiry"] = now + \
-        expires_in - 60  # renew 1 min before expiry
-    print(token)
-    return token
+    # Instruct user to sign in using the printed code and URL
+    print(flow["message"])
+
+    result = msal_app.acquire_token_by_device_flow(
+        flow)  # This blocks until sign-in completed
+
+    if "access_token" in result:
+        token_cache["token"] = result["access_token"]
+        token_cache["expiry"] = now + int(result.get("expires_in", 3600)) - 60
+        return token_cache["token"]
+    else:
+        raise Exception("Failed to acquire token: " +
+                        str(result.get("error_description", result)))
 
 
-#      Group Lookup Function    #
 def get_user_group_level(user_id):
-    access_token = get_graph_api_token()
-    url = f"https://graph.microsoft.com/v1.0/users/{user_id}/memberOf"
+    access_token = get_token_device_code_flow()
+    url = f"https://graph.microsoft.com/v1.0/users/{user_id}/memberOf?$select=id,displayName"
     headers = {"Authorization": f"Bearer {access_token}"}
 
     response = requests.get(url, headers=headers)
@@ -91,13 +91,10 @@ def get_user_group_level(user_id):
             return "Level 3"
         elif name == "Level4Access":
             return "Level 4"
+    return None
 
-    return None  # Not found
 
-
-#      Main Bot Handler         #
 async def handle_message(turn_context: TurnContext):
-    # Handle conversationUpdate event to send greeting once
     if turn_context.activity.type == "conversationUpdate":
         members_added = turn_context.activity.members_added
         if members_added:
@@ -106,17 +103,18 @@ async def handle_message(turn_context: TurnContext):
                     await turn_context.send_activity("Hello! How can I assist you today?")
         return
 
-    # Only handle non-empty 'message' activities
     if turn_context.activity.type != "message" or not turn_context.activity.text or not turn_context.activity.text.strip():
-        return  # Ignore empty or whitespace messages
+        return
 
     user_id = turn_context.activity.from_property.aad_object_id or turn_context.activity.from_property.id
     user_input = turn_context.activity.text
 
     try:
         await turn_context.send_activity(Activity(type="typing"))
-        user_id = "a62bf818-86a9-4a27-80d3-b087ea19e3f8"
-        # Resolve assistant by group
+
+        # Optionally, override user_id for testing:
+        # user_id = "a62bf818-86a9-4a27-80d3-b087ea19e3f8"
+
         level = get_user_group_level(user_id)
         assistant_map = {
             "Level 1": "asst_r6q2Ve7DDwrzh0m3n3sbOote",
@@ -124,23 +122,21 @@ async def handle_message(turn_context: TurnContext):
             "Level 3": "asst_SLWGUNXMQrmzpJIN1trU0zSX",
             "Level 4": "asst_s1OefDDIgDVpqOgfp5pfCpV1"
         }
-        assistant_id = assistant_map.get("Level 1", os.getenv("ASSISTANT_ID"))
+        assistant_id = assistant_map.get(level, os.getenv("ASSISTANT_ID"))
         print(f"Using assistant: {assistant_id} for user {user_id}")
-        # Get or create thread
+
         thread_id = thread_map.get(user_id)
         if not thread_id:
             thread = openai.beta.threads.create()
             thread_id = thread.id
             thread_map[user_id] = thread_id
 
-        # Add user message
         openai.beta.threads.messages.create(
             thread_id=thread_id,
             role="user",
             content=user_input
         )
 
-        # Run assistant
         run = openai.beta.threads.runs.create(
             assistant_id=assistant_id,
             thread_id=thread_id
@@ -153,11 +149,10 @@ async def handle_message(turn_context: TurnContext):
                 run_id=run.id
             )
 
-        # Fetch reply
         messages = openai.beta.threads.messages.list(thread_id=thread_id)
         assistant_reply = None
         for msg in messages.data:
-            if msg.role == "assistant":
+            if msg.role == "assistant" and msg.content:
                 assistant_reply = msg.content[0].text.value
                 break
 
@@ -178,8 +173,6 @@ async def handle_message(turn_context: TurnContext):
         service_url=turn_context.activity.service_url
     ))
 
-
-#       Flask Endpoints         #
 
 @app.route("/api/messages", methods=["POST"])
 def messages():
@@ -206,7 +199,6 @@ def health_check():
     return "Teams Bot is running."
 
 
-#       Run Flask Server        #
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     app.run(host="0.0.0.0", port=3978)
