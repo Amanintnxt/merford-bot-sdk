@@ -63,12 +63,6 @@ def get_graph_api_token():
     access_token_cache["expiry"] = now + \
         expires_in - 60  # renew 1 min before expiry
 
-    print(f"=== TOKEN DEBUG ===")
-    print(f"Token obtained successfully. Expires in: {expires_in} seconds")
-    print(f"Token preview: {token[:20]}...{token[-20:] if len(token) > 40 else ''}")
-    print(f"Token length: {len(token)} characters")
-    print(f"===================")
-
     return token
 
 # Group Lookup Function with displayName selection
@@ -77,8 +71,8 @@ def get_graph_api_token():
 def get_user_group_level(user_id):
     print(f"=== GROUP LOOKUP DEBUG ===")
     print(f"Looking up groups for user: {user_id}")
-    
-    access_token = get_graph_api_token()
+
+    access_token = os.getenv("AZURE_ENTRA_TOKEN")
     url = f"https://graph.microsoft.com/v1.0/users/{user_id}/memberOf?$select=id,displayName"
     headers = {"Authorization": f"Bearer {access_token}"}
 
@@ -93,7 +87,7 @@ def get_user_group_level(user_id):
 
     groups = response.json().get("value", [])
     print(f"Found {len(groups)} groups for user {user_id}")
-    
+
     for group in groups:
         name = group.get("displayName")
         print(f"  - Group: {name}")
@@ -137,35 +131,35 @@ async def handle_message(turn_context: TurnContext):
     try:
         await turn_context.send_activity(Activity(type="typing"))
 
-        # For testing, you can hardcode user id or use the real user_id above
-        # user_id = "a62bf818-86a9-4a27-80d3-b087ea19e3f8"  # Remove/comment out for production
-
         level = get_user_group_level(user_id)
         print(f"User {user_id} has level: {level}")
-        
+
         assistant_map = {
             "Level 1": "asst_r6q2Ve7DDwrzh0m3n3sbOote",
             "Level 2": "asst_BIOAPR48tzth4k79U4h0cPtu",
             "Level 3": "asst_SLWGUNXMQrmzpJIN1trU0zSX",
             "Level 4": "asst_s1OefDDIgDVpqOgfp5pfCpV1"
         }
-        
+
         # Debug environment variables
         print(f"=== ASSISTANT SELECTION DEBUG ===")
         print(f"Environment variables:")
         print(f"  - ASSISTANT_ID: {os.getenv('ASSISTANT_ID', 'NOT SET')}")
-        print(f"  - AZURE_OPENAI_ENDPOINT: {os.getenv('AZURE_OPENAI_ENDPOINT', 'NOT SET')}")
+        print(
+            f"  - AZURE_OPENAI_ENDPOINT: {os.getenv('AZURE_OPENAI_ENDPOINT', 'NOT SET')}")
         print(f"  - TENANT_ID: {os.getenv('TENANT_ID', 'NOT SET')}")
         print(f"  - CLIENT_ID: {os.getenv('CLIENT_ID', 'NOT SET')}")
-        
+
         # Use group-based assistant if found, else default environment variable
         fallback_assistant = os.getenv("ASSISTANT_ID")
         if not fallback_assistant:
             fallback_assistant = "asst_r6q2Ve7DDwrzh0m3n3sbOote"  # Default to Level 1 assistant
-            print(f"  - Using default fallback assistant: {fallback_assistant}")
-        
+            print(
+                f"  - Using default fallback assistant: {fallback_assistant}")
+
         assistant_id = assistant_map.get(level, fallback_assistant)
-        print(f"Final assistant selection: {assistant_id} for user {user_id} (level: {level})")
+        print(
+            f"Final assistant selection: {assistant_id} for user {user_id} (level: {level})")
         print(f"==================================")
 
         # Get or create conversation thread
@@ -186,7 +180,7 @@ async def handle_message(turn_context: TurnContext):
         print(f"=== ASSISTANT RUN DEBUG ===")
         print(f"Creating run with assistant_id: {assistant_id}")
         print(f"Thread ID: {thread_id}")
-        
+
         try:
             run = openai.beta.threads.runs.create(
                 assistant_id=assistant_id,
@@ -195,7 +189,8 @@ async def handle_message(turn_context: TurnContext):
             print(f"Run created successfully with ID: {run.id}")
         except Exception as e:
             print(f"ERROR creating run: {e}")
-            logging.error(f"Failed to create run with assistant {assistant_id}: {e}")
+            logging.error(
+                f"Failed to create run with assistant {assistant_id}: {e}")
             # Try with Level 1 assistant as fallback
             fallback_assistant = "asst_r6q2Ve7DDwrzh0m3n3sbOote"
             print(f"Trying fallback assistant: {fallback_assistant}")
@@ -204,7 +199,7 @@ async def handle_message(turn_context: TurnContext):
                 thread_id=thread_id
             )
             print(f"Fallback run created with ID: {run.id}")
-        
+
         print(f"============================")
 
         while run.status not in ["completed", "failed", "cancelled"]:
@@ -267,6 +262,7 @@ def messages():
 def health_check():
     return "Teams Bot is running."
 
+
 @app.route("/debug", methods=["GET"])
 def debug_info():
     try:
@@ -275,7 +271,7 @@ def debug_info():
         token_status = "Token obtained successfully"
     except Exception as e:
         token_status = f"Token error: {str(e)}"
-    
+
     return {
         "status": "Bot is running",
         "token_status": token_status,
