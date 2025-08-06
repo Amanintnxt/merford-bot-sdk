@@ -140,28 +140,8 @@ async def handle_message(turn_context: TurnContext):
             "Level 3": "asst_SLWGUNXMQrmzpJIN1trU0zSX",
             "Level 4": "asst_s1OefDDIgDVpqOgfp5pfCpV1"
         }
-
-        # Debug environment variables
-        print(f"=== ASSISTANT SELECTION DEBUG ===")
-        print(f"Environment variables:")
-        print(f"  - ASSISTANT_ID: {os.getenv('ASSISTANT_ID', 'NOT SET')}")
-        print(
-            f"  - AZURE_OPENAI_ENDPOINT: {os.getenv('AZURE_OPENAI_ENDPOINT', 'NOT SET')}")
-        print(f"  - TENANT_ID: {os.getenv('TENANT_ID', 'NOT SET')}")
-        print(f"  - CLIENT_ID: {os.getenv('CLIENT_ID', 'NOT SET')}")
-
-        # Use group-based assistant if found, else default environment variable
-        fallback_assistant = os.getenv("ASSISTANT_ID")
-        if not fallback_assistant:
-            fallback_assistant = "asst_r6q2Ve7DDwrzh0m3n3sbOote"  # Default to Level 1 assistant
-            print(
-                f"  - Using default fallback assistant: {fallback_assistant}")
-
-        assistant_id = assistant_map.get(level, fallback_assistant)
-        print(
-            f"Final assistant selection: {assistant_id} for user {user_id} (level: {level})")
-        print(f"==================================")
-
+        assistant_id = assistant_map.get(level, os.getenv("ASSISTANT_ID"))
+        print(f"Using assistant: {assistant_id} for user {user_id}")
         # Get or create conversation thread
         thread_id = thread_map.get(user_id)
         if not thread_id:
