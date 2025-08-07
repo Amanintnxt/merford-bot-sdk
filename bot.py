@@ -28,7 +28,7 @@ AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 # OAuth Connection in Azure
 CONNECTION_NAME = os.getenv("OAUTH_CONNECTION_NAME")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID")
-
+TENANT_ID = os.getenv("TENANT_ID")
 
 # Configure OpenAI
 openai.api_type = "azure"
@@ -54,7 +54,9 @@ dialogs.add(OAuthPrompt(
         connection_name=CONNECTION_NAME,
         text="Please sign in to access your profile.",
         title="Sign In",
-        timeout=300000  # 5 minutes
+        timeout=300000,
+        o_auth_authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+        o_auth_redirect_uri="https://merford-bot-sdk.onrender.com/teamsso/callback"
     )
 ))
 
