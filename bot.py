@@ -1,139 +1,146 @@
 import os
 import json
+import time
 import requests
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from botbuilder.core import (
-    BotFrameworkAdapter,
     BotFrameworkAdapterSettings,
-    MemoryStorage,
+    TurnContext,
     ConversationState,
-    TurnContext
+    MemoryStorage,
+    BotFrameworkAdapter,
 )
 from botbuilder.schema import Activity
 from botbuilder.dialogs import DialogSet, DialogTurnStatus, OAuthPrompt, OAuthPromptSettings, PromptOptions
+from openai import AzureOpenAI
 
-app = Flask(__name__)
-
-# Adapter setup
-settings = BotFrameworkAdapterSettings(
-    app_id=os.getenv("MicrosoftAppId"),
-    app_password=os.getenv("MicrosoftAppPassword")
-)
-adapter = BotFrameworkAdapter(settings)
-
-# Memory & conversation state
-memory = MemoryStorage()
-conversation_state = ConversationState(memory)
-dialogs = DialogSet(conversation_state.create_property("DialogState"))
-
-# OAuthPrompt setup
+# === Environment Variables ===
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+TENANT_ID = os.getenv("TENANT_ID")
 OAUTH_CONNECTION_NAME = os.getenv("OAUTH_CONNECTION_NAME")
-dialogs.add(OAuthPrompt(
-    "OAuthPrompt",
-    OAuthPromptSettings(
-        connection_name=OAUTH_CONNECTION_NAME,
-        text="Please sign in to continue",
-        title="Sign In",
-        timeout=300000
-    )
-))
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_ENTRA_TOKEN = os.getenv("AZURE_ENTRA_TOKEN")
 
-# Group to Assistant mapping
-group_to_assistant = {
+ASSISTANT_IDS = {
     "Level1Access": os.getenv("ASSISTANT_ID_LEVEL1"),
     "Level2Access": os.getenv("ASSISTANT_ID_LEVEL2"),
     "Level3Access": os.getenv("ASSISTANT_ID_LEVEL3"),
     "Level4Access": os.getenv("ASSISTANT_ID_LEVEL4"),
 }
 
-# Azure OpenAI settings
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+# === Flask Setup ===
+app = Flask(__name__)
 
-# Util: Get user groups from Graph API
+# === Bot Framework Adapter ===
+adapter_settings = BotFrameworkAdapterSettings(
+    app_id=os.getenv("MicrosoftAppId"),
+    app_password=os.getenv("MicrosoftAppPassword"),
+)
+adapter = BotFrameworkAdapter(adapter_settings)
+
+# === Conversation State ===
+memory = MemoryStorage()
+conversation_state = ConversationState(memory)
+dialog_state = conversation_state.create_property("DialogState")
+dialogs = DialogSet(dialog_state)
+
+oauth_settings = OAuthPromptSettings(
+    connection_name=OAUTH_CONNECTION_NAME,
+    text="Please sign in",
+    title="Sign In",
+    timeout=300000,
+)
+
+dialogs.add(OAuthPrompt("OAuthPrompt", oauth_settings))
+
+# === Azure OpenAI Client ===
+openai_client = AzureOpenAI(
+    api_key=AZURE_OPENAI_API_KEY,
+    api_version=os.getenv("OPENAI_API_VERSION"),
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+)
+
+# === Helper Functions ===
 
 
 def get_user_groups(token):
-    headers = {
-        "Authorization": f"Bearer {token}"
-    }
-    url = "https://graph.microsoft.com/v1.0/me/memberOf"
-    res = requests.get(url, headers=headers)
-    print(f"[Graph API] Response: {res.status_code}")
-    print(res.text)
-    if res.status_code == 200:
-        data = res.json()
-        return [group["displayName"] for group in data["value"]]
+    graph_url = "https://graph.microsoft.com/v1.0/me/memberOf"
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get(graph_url, headers=headers)
+    if response.status_code == 200:
+        data = response.json()
+        return [group["displayName"] for group in data.get("value", [])]
     return []
 
-# Util: Call Azure OpenAI Assistant
+
+def get_assistant_id_from_groups(groups):
+    for group in groups:
+        if group in ASSISTANT_IDS:
+            return ASSISTANT_IDS[group]
+    raise Exception("❌ No assistant mapped for user group.")
 
 
-def call_assistant(assistant_id, user_input):
-    url = f"{AZURE_OPENAI_ENDPOINT}/openai/assistants/{assistant_id}/threads"
-    headers = {
-        "api-key": AZURE_OPENAI_API_KEY,
-        "Content-Type": "application/json"
-    }
-    body = {
-        "messages": [{"role": "user", "content": user_input}]
-    }
-    res = requests.post(url, headers=headers, json=body)
-    if res.status_code == 200:
-        return res.json()["choices"][0]["message"]["content"]
-    else:
-        print(f"[OpenAI Error]: {res.status_code} {res.text}")
-        return "Sorry, I couldn't get a response from the assistant."
+def send_to_openai_assistant(assistant_id, user_input):
+    thread = openai_client.beta.threads.create()
+    openai_client.beta.threads.messages.create(
+        thread_id=thread.id,
+        role="user",
+        content=user_input,
+    )
+    run = openai_client.beta.threads.runs.create(
+        thread_id=thread.id,
+        assistant_id=assistant_id,
+    )
+    while True:
+        run_status = openai_client.beta.threads.runs.retrieve(
+            thread_id=thread.id, run_id=run.id
+        )
+        if run_status.status == "completed":
+            break
+        time.sleep(1)
+    messages = openai_client.beta.threads.messages.list(thread_id=thread.id)
+    return messages.data[0].content[0].text.value
 
-# Bot endpoint
+# === Flask Bot Route ===
 
 
 @app.route("/api/messages", methods=["POST"])
-async def messages():
+def messages():
     activity = Activity().deserialize(request.json)
 
+    if activity.type != "message":
+        return jsonify({"status": "ignored"})
+
     async def call_bot(turn_context: TurnContext):
-        dialog_context = await dialogs.create_context(turn_context)
+        dc = await dialogs.create_context(turn_context)
+        results = await dc.continue_dialog()
 
-        if activity.type != "message":
-            return
+        if results.status == DialogTurnStatus.Empty:
+            await dc.begin_dialog("OAuthPrompt")
+        elif results.status == DialogTurnStatus.Complete:
+            token_response = results.result
+            if token_response:
+                token = token_response.token
+                user_groups = get_user_groups(token)
+                assistant_id = get_assistant_id_from_groups(user_groups)
 
-        if dialog_context.active_dialog is None:
-            prompt_options = PromptOptions(prompt=Activity(
-                type="message", text="Please sign in"))
-            await dialog_context.prompt("OAuthPrompt", prompt_options)
-        else:
-            result = await dialog_context.continue_dialog()
-            if result.status == DialogTurnStatus.Complete:
-                token_response = result.result
-                access_token = token_response.token
-                print(f"[Access Token] {access_token}")
-
-                print(
-                    f"[SSO] OAuth Token Response: {json.dumps(token_response.additional_properties, indent=2)}")
-
-                user_groups = get_user_groups(access_token)
-                print(f"[User Groups] {user_groups}")
-
-                assistant_id = None
-                for group in user_groups:
-                    if group in group_to_assistant:
-                        assistant_id = group_to_assistant[group]
-                        break
-
-                if assistant_id is None:
-                    await turn_context.send_activity("You are not assigned to any assistant group.")
-                else:
-                    user_input = activity.text
-                    response = call_assistant(assistant_id, user_input)
-                    await turn_context.send_activity(response)
+                response = send_to_openai_assistant(
+                    assistant_id=assistant_id,
+                    user_input=turn_context.activity.text,
+                )
+                await turn_context.send_activity(response)
+            else:
+                await turn_context.send_activity("❌ Login failed.")
 
         await conversation_state.save_changes(turn_context)
 
-    await adapter.process_activity(activity, "", call_bot)
-    return "", 200
+    task = adapter.process_activity(activity, "", call_bot)
+    return jsonify({"status": "ok"})
 
-# ✅ Run server
+
+# === App Entry Point ===
 if __name__ == "__main__":
     try:
         print("🚀 Starting bot on Render...")
