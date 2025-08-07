@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 import requests
-from flask import Flask, request, render_template, jsonify
+from flask import Flask, request, send_from_directory, jsonify
 from dotenv import load_dotenv
 from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext, ConversationState, MemoryStorage
 from botbuilder.schema import Activity
@@ -64,7 +64,7 @@ dialogs.add(OAuthPrompt("OAuthPrompt", oauth_prompt_settings))
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return send_from_directory("static", "index.html")
 
 # === Bot endpoint ===
 
