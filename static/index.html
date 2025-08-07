@@ -2,54 +2,24 @@
 <html>
 
 <head>
-    <title>Bot with SSO</title>
+    <title>AI Assistant</title>
     <script src="https://cdn.botframework.com/botframework-webchat/latest/webchat.js"></script>
-    <style>
-        html,
-        body {
-            height: 100%;
-            margin: 0;
-            font-family: Arial, sans-serif;
-        }
-
-        #webchat {
-            height: 100%;
-            width: 100%;
-        }
-    </style>
 </head>
 
 <body>
-    <div id="webchat"></div>
+    <div id="webchat" role="main" style="height: 500px; width: 100%;"></div>
 
     <script>
-        async function initWebChat() {
-            const res = await fetch("/directline/token");
-            const { token } = await res.json();
-
-            const store = window.WebChat.createStore({}, ({ dispatch }) => next => action => {
-                if (action.type === 'DIRECT_LINE/CONNECT_FULFILLED') {
-                    dispatch({
-                        type: 'WEB_CHAT/SEND_EVENT',
-                        payload: {
-                            name: 'webchat/join',
-                            value: { language: window.navigator.language }
-                        }
-                    });
-                }
-                return next(action);
+        fetch('/directline/token')
+            .then(res => res.json())
+            .then(json => {
+                window.WebChat.renderWebChat({
+                    directLine: window.WebChat.createDirectLine({ token: json.token }),
+                    userID: 'user_' + Date.now(),
+                    username: 'User',
+                    locale: 'en-US'
+                }, document.getElementById('webchat'));
             });
-
-            window.WebChat.renderWebChat({
-                directLine: window.WebChat.createDirectLine({ token }),
-                userID: 'user1',
-                username: 'You',
-                locale: 'en-US',
-                store
-            }, document.getElementById('webchat'));
-        }
-
-        initWebChat();
     </script>
 </body>
 

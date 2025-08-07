@@ -1,204 +1,203 @@
 import os
-import time
-import openai
 import asyncio
-import logging
-import requests
-from dotenv import load_dotenv
-from flask import Flask, request, Response
-
+from flask import Flask, request, jsonify, send_from_directory
 from botbuilder.core import (
-    BotFrameworkAdapterSettings,
     BotFrameworkAdapter,
-    TurnContext,
-    MemoryStorage,
+    BotFrameworkAdapterSettings,
     ConversationState,
-    UserState
+    MemoryStorage,
+    TurnContext,
+    UserState,
 )
 from botbuilder.schema import Activity
-from botbuilder.dialogs import DialogSet, DialogTurnStatus, WaterfallDialog, WaterfallStepContext, OAuthPrompt, OAuthPromptSettings
+from botbuilder.dialogs import (
+    DialogSet,
+    DialogTurnStatus,
+    OAuthPrompt,
+    OAuthPromptSettings,
+    WaterfallDialog,
+    WaterfallStepContext,
+)
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+from openai import AzureOpenAI
+import requests
+from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
-# Environment variables
-APP_ID = os.getenv("MicrosoftAppId", "")
-APP_PASSWORD = os.getenv("MicrosoftAppPassword", "")
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-CONNECTION_NAME = os.getenv("ConnectionName")  # OAuth Connection in Azure
-ASSISTANT_ID = os.getenv("ASSISTANT_ID")
 
-# Configure OpenAI
-openai.api_type = "azure"
-openai.api_version = "2024-05-01-preview"
-openai.api_key = AZURE_OPENAI_API_KEY
-openai.azure_endpoint = AZURE_OPENAI_ENDPOINT.rstrip("/")
+# ====== ENV VARIABLES ======
+APP_ID = os.environ["MicrosoftAppId"]
+APP_PASSWORD = os.environ["MicrosoftAppPassword"]
+CONNECTION_NAME = os.environ["OAUTH_CONNECTION_NAME"]
+ASSISTANT_ID_DEFAULT = os.environ["ASSISTANT_ID"]
+TENANT_ID = os.environ["TENANT_ID"]
+CLIENT_ID = os.environ["CLIENT_ID"]
+CLIENT_SECRET = os.environ["CLIENT_SECRET"]
+AZURE_OPENAI_API_KEY = os.environ["AZURE_OPENAI_API_KEY"]
+AZURE_OPENAI_ENDPOINT = os.environ["AZURE_OPENAI_ENDPOINT"]
+DIRECT_LINE_SECRET = os.environ["DIRECT_LINE_SECRET"]
 
-# Flask app and adapter
+# ====== Azure OpenAI Setup ======
+token_provider = get_bearer_token_provider(
+    DefaultAzureCredential(),
+    "https://cognitiveservices.azure.com/.default"
+)
+
+openai = AzureOpenAI(
+    azure_ad_token_provider=token_provider,
+    api_key=AZURE_OPENAI_API_KEY,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT
+)
+
+# ====== Bot Setup ======
 app = Flask(__name__)
+loop = asyncio.get_event_loop()
 adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
 adapter = BotFrameworkAdapter(adapter_settings)
 
-# Bot state
 memory = MemoryStorage()
-conversation_state = ConversationState(memory)
 user_state = UserState(memory)
-dialogs = DialogSet(conversation_state.create_property("DialogState"))
+conversation_state = ConversationState(memory)
+dialog_state = conversation_state.create_property("DialogState")
+user_profile_accessor = user_state.create_property("UserProfile")
 
-# OAuth Prompt setup
-dialogs.add(OAuthPrompt(
+dialogs = DialogSet(dialog_state)
+
+oauth_prompt = OAuthPrompt(
     OAuthPrompt.__name__,
     OAuthPromptSettings(
         connection_name=CONNECTION_NAME,
-        text="Please sign in to access your profile.",
+        text="Please sign in to continue.",
         title="Sign In",
-        timeout=300000  # 5 minutes
-    )
-))
+        timeout=300000,
+    ),
+)
+dialogs.add(oauth_prompt)
 
-dialogs.add(WaterfallDialog(
-    "MainDialog",
-    [
-        lambda step: step.begin_dialog(OAuthPrompt.__name__),
-        lambda step: handle_token(step)
-    ]
-))
+# ====== Group → Assistant Map ======
+assistant_map = {
+    "Level1Access": "asst_r6q2Ve7DDwrzh0m3n3sbOote",
+    "Level2Access": "asst_BIOAPR48tzth4k79U4h0cPtu",
+    "Level3Access": "asst_SLWGUNXMQrmzpJIN1trU0zSX",
+    "Level4Access": "asst_s1OefDDIgDVpqOgfp5pfCpV1"
+}
 
-# Map thread to user
-thread_map = {}
-
-# Handle token and continue conversation
+# ====== Waterfall Dialog ======
 
 
-async def handle_token(step: WaterfallStepContext):
+async def prompt_step(step: WaterfallStepContext):
+    return await step.begin_dialog(OAuthPrompt.__name__)
+
+
+async def token_step(step: WaterfallStepContext):
     token_response = step.result
     if not token_response:
-        await step.context.send_activity("Sorry, I couldn't log you in.")
+        await step.context.send_activity("Login was not successful.")
         return await step.end_dialog()
 
-    user_id = step.context.activity.from_property.aad_object_id
     access_token = token_response.token
-
-    # 🔐 Use delegated token to call Microsoft Graph (e.g., group check)
-    graph_url = f"https://graph.microsoft.com/v1.0/users/{user_id}/memberOf?$select=id,displayName"
     headers = {"Authorization": f"Bearer {access_token}"}
-    response = requests.get(graph_url, headers=headers)
-    groups = response.json().get("value", [])
+    graph_url = "https://graph.microsoft.com/v1.0/me/memberOf"
+    res = requests.get(graph_url, headers=headers)
 
-    level = None
+    if res.status_code != 200:
+        await step.context.send_activity("Failed to retrieve group info.")
+        return await step.end_dialog()
+
+    groups = res.json().get("value", [])
+    assistant_id = ASSISTANT_ID_DEFAULT
+
     for g in groups:
-        name = g.get("displayName")
-        if name == "Level1Access":
-            level = "Level 1"
-        elif name == "Level2Access":
-            level = "Level 2"
-        elif name == "Level3Access":
-            level = "Level 3"
-        elif name == "Level4Access":
-            level = "Level 4"
-
-    # Choose assistant
-    assistant_map = {
-        "Level 1": "asst_r6q2Ve7DDwrzh0m3n3sbOote",
-        "Level 2": "asst_BIOAPR48tzth4k79U4h0cPtu",
-        "Level 3": "asst_SLWGUNXMQrmzpJIN1trU0zSX",
-        "Level 4": "asst_s1OefDDIgDVpqOgfp5pfCpV1"
-    }
-    assistant_id = assistant_map.get(level, ASSISTANT_ID)
-
-    # Thread setup
-    if user_id not in thread_map:
-        thread = openai.beta.threads.create()
-        thread_map[user_id] = thread.id
-    thread_id = thread_map[user_id]
-
-    # Add greeting
-    openai.beta.threads.messages.create(
-        thread_id=thread_id,
-        role="user",
-        content="Hi"
-    )
-
-    run = openai.beta.threads.runs.create(
-        assistant_id=assistant_id,
-        thread_id=thread_id
-    )
-
-    while run.status not in ["completed", "failed", "cancelled"]:
-        time.sleep(1)
-        run = openai.beta.threads.runs.retrieve(
-            thread_id=thread_id,
-            run_id=run.id
-        )
-
-    messages = openai.beta.threads.messages.list(thread_id=thread_id)
-    assistant_reply = None
-    for msg in messages.data:
-        if msg.role == "assistant":
-            assistant_reply = msg.content[0].text.value
+        group_name = g.get("displayName")
+        if group_name in assistant_map:
+            assistant_id = assistant_map[group_name]
             break
 
-    if not assistant_reply:
-        assistant_reply = "I couldn't get a reply from the assistant."
+    user_profile = await user_profile_accessor.get(step.context, {})
+    user_profile["assistant_id"] = assistant_id
 
-    await step.context.send_activity(assistant_reply)
+    if "thread_id" not in user_profile:
+        thread = openai.beta.threads.create()
+        user_profile["thread_id"] = thread.id
+
+    await user_profile_accessor.set(step.context, user_profile)
+    await user_state.save_changes(step.context)
+
+    await step.context.send_activity("✅ Signed in successfully!")
+    await step.context.send_activity("Hello! How can I assist you today?")
     return await step.end_dialog()
 
-# Handle every message
+dialogs.add(WaterfallDialog("main_dialog", [prompt_step, token_step]))
+
+# ====== Message Handler ======
 
 
-async def handle_message(turn_context: TurnContext):
-    if turn_context.activity.type == "message":
-        dc = await dialogs.create_context(turn_context)
-        result = await dc.continue_dialog()
-        if result.status == DialogTurnStatus.Empty:
-            await dc.begin_dialog("MainDialog")
-    elif turn_context.activity.type == "conversationUpdate":
-        for member in turn_context.activity.members_added:
-            if member.id != turn_context.activity.recipient.id:
-                await turn_context.send_activity("Hello! You may be prompted to sign in.")
+async def handle_message(context: TurnContext):
+    dialog_ctx = await dialogs.create_context(context)
+    results = await dialog_ctx.continue_dialog()
 
-# Bot endpoint
+    if results.status == DialogTurnStatus.Empty:
+        await dialog_ctx.begin_dialog("main_dialog")
+        return
+
+    elif results.status == DialogTurnStatus.Complete:
+        user_profile = await user_profile_accessor.get(context, {})
+        assistant_id = user_profile.get("assistant_id", ASSISTANT_ID_DEFAULT)
+        thread_id = user_profile.get("thread_id")
+
+        message = context.activity.text
+        openai.beta.threads.messages.create(
+            thread_id, role="user", content=message
+        )
+
+        run = openai.beta.threads.runs.create(
+            thread_id, assistant_id=assistant_id
+        )
+
+        while True:
+            run_status = openai.beta.threads.runs.retrieve(thread_id, run.id)
+            if run_status.status == "completed":
+                break
+            await asyncio.sleep(1)
+
+        messages = openai.beta.threads.messages.list(thread_id)
+        last_msg = messages.data[0].content[0].text.value
+        await context.send_activity(last_msg)
+
+# ====== Flask Routes ======
 
 
 @app.route("/api/messages", methods=["POST"])
 def messages():
+    if "application/json" not in request.headers["Content-Type"]:
+        return jsonify({"error": "Unsupported Media Type"}), 415
+
     activity = Activity().deserialize(request.json)
     auth_header = request.headers.get("Authorization", "")
 
-    async def aux():
+    async def call_bot():
         await adapter.process_activity(activity, auth_header, handle_message)
-    try:
-        asyncio.run(aux())
-        return Response(status=200)
-    except Exception as e:
-        logging.error(f"Exception: {e}")
-        return Response("Internal Server Error", status=500)
+
+    loop.run_until_complete(call_bot())
+    return "", 202
 
 
 @app.route("/")
-def root():
-    return app.send_static_file("index.html")
+def index():
+    return send_from_directory(".", "index.html")
 
 
 @app.route("/directline/token", methods=["GET"])
-def get_directline_token():
-    directline_secret = os.getenv("DIRECT_LINE_SECRET")
-    if not directline_secret:
-        return {"error": "Missing secret"}, 500
-
-    response = requests.post(
-        "https://directline.botframework.com/v3/directline/tokens/generate",
-        headers={"Authorization": f"Bearer {directline_secret}"}
-    )
-
-    if response.status_code == 200:
-        return response.json()
-    else:
-        return {"error": "Failed to fetch token"}, response.status_code
+def direct_line_token():
+    url = "https://directline.botframework.com/v3/directline/tokens/generate"
+    headers = {
+        "Authorization": f"Bearer {DIRECT_LINE_SECRET}",
+        "Content-Type": "application/json"
+    }
+    res = requests.post(url, headers=headers)
+    return jsonify(res.json())
 
 
-# Run the app
+# ====== Run Server ======
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    app.run("0.0.0.0", port=3978)
+    app.run(port=3978, debug=True)
