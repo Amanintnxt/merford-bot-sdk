@@ -66,7 +66,7 @@ dialogs.add(OAuthPrompt("OAuthPrompt", oauth_prompt_settings))
 def index():
     return send_from_directory("static", "index.html")
 
-# === Bot endpoint ===
+# Bot endpoint
 
 
 @app.route("/api/messages", methods=["POST"])
