@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ====== ENV VARIABLES ======
+# ENV VARIABLES
 APP_ID = os.environ["MicrosoftAppId"]
 APP_PASSWORD = os.environ["MicrosoftAppPassword"]
 CONNECTION_NAME = os.environ["OAUTH_CONNECTION_NAME"]
