@@ -187,7 +187,7 @@ def teams_callback():
         "grant_type": "authorization_code",
         "code": code,
         "redirect_uri": "https://merford-bot-sdk.onrender.com/teamsso/callback",
-        "scope": "openid profile email offline_access openid profile email offline_access User.Read Directory.Read.All Group.Read.All GroupMember.Read.All"
+        "scope": " openid profile email offline_access User.Read Directory.Read.All Group.Read.All GroupMember.Read.All"
     }
 
     token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
