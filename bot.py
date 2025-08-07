@@ -86,7 +86,7 @@ async def handle_message(turn_context: TurnContext):
     if turn_context.activity.type == "message":
         user_id = turn_context.activity.from_property.aad_object_id
         dc = await dialogs.create_context(turn_context)
-
+        print(f'access_token = {access_token_map}')
         # Check if token is available for user
         token = access_token_map.get(user_id)
         if not token:
