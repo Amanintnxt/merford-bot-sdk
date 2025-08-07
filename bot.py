@@ -183,6 +183,13 @@ def health():
     return "Bot running with SSO!"
 
 
+@app.route("/teamsso/callback", methods=["GET"])
+def teams_callback():
+    # Print the entire query parameters
+    print("Query Params:", request.args)
+    return "Bot running with SSO! callback"
+
+
 # Run the app
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
