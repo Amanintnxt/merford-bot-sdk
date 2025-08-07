@@ -46,15 +46,11 @@ group_to_assistant = {
     "Level4Access": os.getenv("ASSISTANT_ID_LEVEL4"),
 }
 
-# Azure AD & OpenAI
-TENANT_ID = os.getenv("TENANT_ID")
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+# Azure OpenAI settings
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-OPENAI_API_VERSION = os.getenv("OPENAI_API_VERSION")
 
-# Util: get user groups
+# Util: Get user groups from Graph API
 
 
 def get_user_groups(token):
@@ -70,7 +66,7 @@ def get_user_groups(token):
         return [group["displayName"] for group in data["value"]]
     return []
 
-# Util: call Azure OpenAI Assistant
+# Util: Call Azure OpenAI Assistant
 
 
 def call_assistant(assistant_id, user_input):
@@ -88,6 +84,8 @@ def call_assistant(assistant_id, user_input):
     else:
         print(f"[OpenAI Error]: {res.status_code} {res.text}")
         return "Sorry, I couldn't get a response from the assistant."
+
+# Bot endpoint
 
 
 @app.route("/api/messages", methods=["POST"])
@@ -111,7 +109,6 @@ async def messages():
                 access_token = token_response.token
                 print(f"[Access Token] {access_token}")
 
-                # Log Graph ID token if available
                 print(
                     f"[SSO] OAuth Token Response: {json.dumps(token_response.additional_properties, indent=2)}")
 
@@ -125,11 +122,21 @@ async def messages():
                         break
 
                 if assistant_id is None:
-                    await turn_context.send_activity("You are not assigned to any group assistant.")
+                    await turn_context.send_activity("You are not assigned to any assistant group.")
                 else:
                     user_input = activity.text
                     response = call_assistant(assistant_id, user_input)
                     await turn_context.send_activity(response)
 
+        await conversation_state.save_changes(turn_context)
+
     await adapter.process_activity(activity, "", call_bot)
     return "", 200
+
+# ✅ Run server
+if __name__ == "__main__":
+    try:
+        print("🚀 Starting bot on Render...")
+        app.run(host="0.0.0.0", port=10000)
+    except Exception as e:
+        print("❌ Bot failed to start:", str(e))
