@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>AI Assistant</title>
+    <script src="https://cdn.botframework.com/botframework-webchat/latest/webchat.js"></script>
+</head>
+
+<body>
+    <div id="webchat" role="main" style="height: 500px; width: 100%;"></div>
+
+    <script>
+        (async function () {
+            const res = await fetch('/directline/token');
+            const { token } = await res.json();
+
+            window.WebChat.renderWebChat({
+                directLine: window.WebChat.createDirectLine({ token }),
+                userID: 'user_' + Date.now(),
+                username: 'User',
+                locale: 'en-US',
+                styleOptions: {
+                    botAvatarInitials: 'AI',
+                    userAvatarInitials: 'U'
+                }
+            }, document.getElementById('webchat'));
+        })();
+    </script>
+</body>
+
+</html>
