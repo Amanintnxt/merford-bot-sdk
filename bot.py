@@ -181,6 +181,28 @@ def health():
     return "Bot running with SSO!"
 
 
+@app.route("/directline/token", methods=["GET"])
+def get_directline_token():
+    directline_secret = os.getenv("DIRECT_LINE_SECRET")
+    if not directline_secret:
+        return {"error": "Missing secret"}, 500
+
+    response = requests.post(
+        "https://directline.botframework.com/v3/directline/tokens/generate",
+        headers={"Authorization": f"Bearer {directline_secret}"}
+    )
+
+    if response.status_code == 200:
+        return response.json()
+    else:
+        return {"error": "Failed to fetch token"}, response.status_code
+
+
+@app.route("/webchat")
+def serve_webchat():
+    return app.send_static_file("index.html")
+
+
 # Run the app
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

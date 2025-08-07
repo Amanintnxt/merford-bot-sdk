@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Bot with SSO</title>
+    <script src="https://cdn.botframework.com/botframework-webchat/latest/webchat.js"></script>
+    <style>
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+            font-family: Arial, sans-serif;
+        }
+
+        #webchat {
+            height: 100%;
+            width: 100%;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="webchat"></div>
+
+    <script>
+        async function initWebChat() {
+            const res = await fetch("/directline/token");
+            const { token } = await res.json();
+
+            const store = window.WebChat.createStore({}, ({ dispatch }) => next => action => {
+                if (action.type === 'DIRECT_LINE/CONNECT_FULFILLED') {
+                    dispatch({
+                        type: 'WEB_CHAT/SEND_EVENT',
+                        payload: {
+                            name: 'webchat/join',
+                            value: { language: window.navigator.language }
+                        }
+                    });
+                }
+                return next(action);
+            });
+
+            window.WebChat.renderWebChat({
+                directLine: window.WebChat.createDirectLine({ token }),
+                userID: 'user1',
+                username: 'You',
+                locale: 'en-US',
+                store
+            }, document.getElementById('webchat'));
+        }
+
+        initWebChat();
+    </script>
+</body>
+
+</html>
