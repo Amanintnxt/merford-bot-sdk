@@ -83,7 +83,7 @@ assistant_map = {
     "Level4Access": "asst_s1OefDDIgDVpqOgfp5pfCpV1"
 }
 
-# ====== Waterfall Dialog ======
+# Waterfall Dialog
 
 
 async def prompt_step(step: WaterfallStepContext):
