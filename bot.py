@@ -176,9 +176,9 @@ def messages():
         return Response("Internal Server Error", status=500)
 
 
-@app.route("/", methods=["GET"])
-def health():
-    return "Bot running with SSO!"
+@app.route("/")
+def root():
+    return app.send_static_file("index.html")
 
 
 @app.route("/directline/token", methods=["GET"])
@@ -196,11 +196,6 @@ def get_directline_token():
         return response.json()
     else:
         return {"error": "Failed to fetch token"}, response.status_code
-
-
-@app.route("/webchat")
-def serve_webchat():
-    return app.send_static_file("index.html")
 
 
 # Run the app
