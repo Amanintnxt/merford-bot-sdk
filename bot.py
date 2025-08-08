@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 from flask import Flask, request, Response
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, TurnContext
 from botbuilder.schema import Activity
+from botbuilder.core.teams import TeamsActivityHandler
+from botbuilder.core.oauth import UserTokenClient
 
 # Load environment variables
 load_dotenv()
@@ -17,9 +19,9 @@ APP_ID = os.getenv("MicrosoftAppId", "")
 APP_PASSWORD = os.getenv("MicrosoftAppPassword", "")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-TENANT_ID = os.getenv("TENANT_ID")
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+
+# OAuth Connection Name from Azure Bot Service
+OAUTH_CONNECTION_NAME = os.getenv("OAUTH_CONNECTION_NAME", "TeamsSSO")
 
 # Configure OpenAI Azure API
 openai.api_type = "azure"
@@ -36,48 +38,36 @@ adapter = BotFrameworkAdapter(adapter_settings)
 thread_map = {}
 
 
-def get_user_group_level(user_id):
-    access_token = os.getenv("AZURE_ENTRA_TOKEN")
+def get_user_group_level(user_id, access_token):
+    """Get the user's group level using a live Graph API token."""
     url = f"https://graph.microsoft.com/v1.0/users/{user_id}/memberOf?$select=id,displayName"
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    print(f"Making request to: {url}")
+    logging.info(f"Fetching group membership for user {user_id}")
     response = requests.get(url, headers=headers)
 
     if response.status_code != 200:
         logging.warning(
             f"Group lookup failed: {response.status_code} - {response.text}")
-        print(f"ERROR: HTTP {response.status_code} - {response.text}")
         return None
 
     groups = response.json().get("value", [])
-    print(f"Found {len(groups)} groups for user {user_id}")
-
     for group in groups:
         name = group.get("displayName")
-        print(f"  - Group: {name}")
         if name == "Level1Access":
-            print(f"    -> Returning Level 1")
             return "Level 1"
         elif name == "Level2Access":
-            print(f"    -> Returning Level 2")
             return "Level 2"
         elif name == "Level3Access":
-            print(f"    -> Returning Level 3")
             return "Level 3"
         elif name == "Level4Access":
-            print(f"    -> Returning Level 4")
             return "Level 4"
 
-    print(f"No matching level groups found for user {user_id}")
-    print(f"==========================")
-    return None  # Not found
-
-# Main Bot Handler
+    return None  # No matching group
 
 
 async def handle_message(turn_context: TurnContext):
-    # Handle conversationUpdate event to send greeting once
+    """Main bot message handler."""
     if turn_context.activity.type == "conversationUpdate":
         members_added = turn_context.activity.members_added
         if members_added:
@@ -86,28 +76,48 @@ async def handle_message(turn_context: TurnContext):
                     await turn_context.send_activity("Hello! How can I assist you today?")
         return
 
-    # Only handle non-empty 'message' activities
-    if turn_context.activity.type != "message" or not turn_context.activity.text or not turn_context.activity.text.strip():
-        return  # Ignore empty or whitespace messages
+    if turn_context.activity.type != "message" or not turn_context.activity.text.strip():
+        return
 
-    user_id = turn_context.activity.from_property.aad_object_id or turn_context.activity.from_property.id
+    # 1️⃣ Retrieve user token from Teams SSO
+    token_client = await adapter.create_user_token_client(turn_context)
+    token_response = await token_client.get_user_token(
+        turn_context.activity.from_property.id,
+        OAUTH_CONNECTION_NAME,
+        turn_context.activity.channel_id,
+        turn_context.activity.from_property.aad_object_id
+    )
+
+    if not token_response or not token_response.token:
+        await turn_context.send_activity("You need to sign in to use this bot.")
+        return
+
+    access_token = token_response.token
+    user_id = turn_context.activity.from_property.aad_object_id
     user_input = turn_context.activity.text
 
     try:
         await turn_context.send_activity(Activity(type="typing"))
 
-        level = get_user_group_level(user_id)
-        print(f"User {user_id} has level: {level}")
+        # 2️⃣ Get the user's group level using live token
+        level = get_user_group_level(user_id, access_token)
+        logging.info(f"User {user_id} has level: {level}")
 
+        if not level:
+            await turn_context.send_activity("You do not have permission to access this bot.")
+            return
+
+        # 3️⃣ Map assistant based on level
         assistant_map = {
             "Level 1": "asst_r6q2Ve7DDwrzh0m3n3sbOote",
             "Level 2": "asst_BIOAPR48tzth4k79U4h0cPtu",
             "Level 3": "asst_SLWGUNXMQrmzpJIN1trU0zSX",
             "Level 4": "asst_s1OefDDIgDVpqOgfp5pfCpV1"
         }
-        assistant_id = assistant_map.get(level, os.getenv("ASSISTANT_ID"))
-        print(f"Using assistant: {assistant_id} for user {user_id}")
-        # Get or create conversation thread
+        assistant_id = assistant_map.get(level)
+        logging.info(f"Using assistant: {assistant_id} for user {user_id}")
+
+        # 4️⃣ Get or create conversation thread
         thread_id = thread_map.get(user_id)
         if not thread_id:
             thread = openai.beta.threads.create()
@@ -121,31 +131,10 @@ async def handle_message(turn_context: TurnContext):
             content=user_input
         )
 
-        # Run assistant
-        print(f"=== ASSISTANT RUN DEBUG ===")
-        print(f"Creating run with assistant_id: {assistant_id}")
-        print(f"Thread ID: {thread_id}")
-
-        try:
-            run = openai.beta.threads.runs.create(
-                assistant_id=assistant_id,
-                thread_id=thread_id
-            )
-            print(f"Run created successfully with ID: {run.id}")
-        except Exception as e:
-            print(f"ERROR creating run: {e}")
-            logging.error(
-                f"Failed to create run with assistant {assistant_id}: {e}")
-            # Try with Level 1 assistant as fallback
-            fallback_assistant = "asst_r6q2Ve7DDwrzh0m3n3sbOote"
-            print(f"Trying fallback assistant: {fallback_assistant}")
-            run = openai.beta.threads.runs.create(
-                assistant_id=fallback_assistant,
-                thread_id=thread_id
-            )
-            print(f"Fallback run created with ID: {run.id}")
-
-        print(f"============================")
+        run = openai.beta.threads.runs.create(
+            assistant_id=assistant_id,
+            thread_id=thread_id
+        )
 
         while run.status not in ["completed", "failed", "cancelled"]:
             time.sleep(1)
@@ -169,7 +158,7 @@ async def handle_message(turn_context: TurnContext):
         logging.error(f"Error handling message: {e}")
         assistant_reply = "Something went wrong."
 
-    # Send the assistant reply message back to the user
+    # 5️⃣ Send reply
     await turn_context.send_activity(Activity(
         type="message",
         text=assistant_reply,
@@ -179,8 +168,6 @@ async def handle_message(turn_context: TurnContext):
         channel_id=turn_context.activity.channel_id,
         service_url=turn_context.activity.service_url
     ))
-
-# Flask Endpoints
 
 
 @app.route("/api/messages", methods=["POST"])
@@ -208,28 +195,6 @@ def health_check():
     return "Teams Bot is running."
 
 
-@app.route("/debug", methods=["GET"])
-def debug_info():
-    try:
-        # Check if we can get a token
-        token = get_graph_api_token()
-        token_status = "Token obtained successfully"
-    except Exception as e:
-        token_status = f"Token error: {str(e)}"
-
-    return {
-        "status": "Bot is running",
-        "token_status": token_status,
-        "environment_vars": {
-            "TENANT_ID": "SET" if os.getenv("TENANT_ID") else "NOT SET",
-            "CLIENT_ID": "SET" if os.getenv("CLIENT_ID") else "NOT SET",
-            "ASSISTANT_ID": os.getenv("ASSISTANT_ID", "NOT SET"),
-            "AZURE_OPENAI_ENDPOINT": "SET" if os.getenv("AZURE_OPENAI_ENDPOINT") else "NOT SET"
-        }
-    }
-
-
-# Run Flask Server
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     app.run(host="0.0.0.0", port=3978)
