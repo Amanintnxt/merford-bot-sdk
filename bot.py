@@ -31,8 +31,9 @@ app = Flask(__name__)
 adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
 adapter = BotFrameworkAdapter(adapter_settings)
 
-# Store conversation threads
+# Store conversation threads & sign-in status
 thread_map = {}
+signed_in_users = {}
 
 # ---------------------------
 # Helper: Get user group level from Microsoft Graph using /me
@@ -67,18 +68,21 @@ def get_user_group_level(access_token):
             return "Level 4"
     return None
 
-
 # ---------------------------
 # Main Bot Logic
 # ---------------------------
+
+
 async def handle_message(turn_context: TurnContext):
-    # Send greeting when conversation starts
+    user_id = turn_context.activity.from_property.id
+
+    # Conversation start
     if turn_context.activity.type == "conversationUpdate":
         members_added = turn_context.activity.members_added
         if members_added:
             for member in members_added:
                 if member.id == turn_context.activity.recipient.id:
-                    await turn_context.send_activity("Hello! How can I assist you today?")
+                    await turn_context.send_activity("✅ You are now connected to the bot.")
         return
 
     # Ignore empty messages
@@ -122,8 +126,14 @@ async def handle_message(turn_context: TurnContext):
 
     # We have a valid token
     access_token = token_response.token
-    level = get_user_group_level(access_token)
 
+    # If user just signed in, greet them and don't call assistant yet
+    if user_id not in signed_in_users:
+        signed_in_users[user_id] = access_token
+        await turn_context.send_activity("🔐 Sign-in successful! You can now ask your questions.")
+        return
+
+    level = get_user_group_level(access_token)
     logging.info(f"User is at: {level}")
 
     if not level:
@@ -139,10 +149,9 @@ async def handle_message(turn_context: TurnContext):
     }
     assistant_id = assistant_map.get(level)
 
-    logging.info(f"User assign to this assistant: {assistant_id}")
+    logging.info(f"User assigned to assistant: {assistant_id}")
 
     # Create or get thread for user
-    user_id = turn_context.activity.from_property.id
     thread_id = thread_map.get(user_id)
     if not thread_id:
         thread = openai.beta.threads.create()
@@ -190,10 +199,11 @@ async def handle_message(turn_context: TurnContext):
         text=assistant_reply
     ))
 
-
 # ---------------------------
 # Flask Endpoints
 # ---------------------------
+
+
 @app.route("/api/messages", methods=["POST"])
 def messages():
     try:
