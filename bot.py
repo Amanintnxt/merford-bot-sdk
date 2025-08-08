@@ -5,7 +5,7 @@ import asyncio
 import logging
 import requests
 from dotenv import load_dotenv
-from flask import Flask, request, Response
+from flask import Flask, request, Response, jsonify, send_from_directory
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, TurnContext
 from botbuilder.schema import Activity, Attachment, CardAction, ActionTypes, OAuthCard
 
@@ -18,6 +18,7 @@ APP_PASSWORD = os.getenv("MicrosoftAppPassword", "")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 OAUTH_CONNECTION_NAME = os.getenv("OAUTH_CONNECTION_NAME", "TeamsSSO")
+DIRECT_LINE_SECRET = os.getenv("DIRECT_LINE_SECRET", "")
 
 # Configure OpenAI Azure API
 openai.api_type = "azure"
@@ -216,6 +217,26 @@ def messages():
 @app.route("/", methods=["GET"])
 def health_check():
     return "Bot is running."
+
+
+@app.route("/directline/token", methods=["POST"])
+def directline_token():
+    """Generates a Direct Line token using your secret."""
+    if not DIRECT_LINE_SECRET:
+        return jsonify({"error": "DIRECT_LINE_SECRET not set"}), 500
+
+    url = "https://directline.botframework.com/v3/directline/tokens/generate"
+    headers = {"Authorization": f"Bearer {DIRECT_LINE_SECRET}"}
+    resp = requests.post(url, headers=headers)
+    if resp.status_code != 200:
+        return jsonify({"error": "Failed to generate token", "details": resp.text}), 500
+    return jsonify({"token": resp.json().get("token")})
+
+
+@app.route("/chat", methods=["GET"])
+def serve_chat():
+    """Serves the Web Chat HTML file."""
+    return send_from_directory(app.static_folder, "index.html")
 
 
 # ---------------------------
