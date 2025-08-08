@@ -7,7 +7,7 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, request, Response
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, TurnContext
-from botbuilder.schema import Activity
+from botbuilder.schema import Activity, OAuthCard, CardAction, ActionTypes, Attachment
 
 # Load environment variables
 load_dotenv()
@@ -73,12 +73,29 @@ async def handle_message(turn_context: TurnContext):
     if turn_context.activity.type != "message" or not turn_context.activity.text.strip():
         return
 
-    # 🔹 Get Teams SSO token for the user
+    # 🔹 Try to get existing token
     token_response = await adapter.get_user_token(turn_context, OAUTH_CONNECTION_NAME)
+
     if not token_response or not token_response.token:
-        await turn_context.send_activity("You need to sign in to use this bot.")
+        # Send OAuthCard Sign-in Button
+        sign_in_url = await adapter.get_oauth_sign_in_link(turn_context, OAUTH_CONNECTION_NAME)
+        oauth_card = OAuthCard(
+            text="Please sign in to continue.",
+            connection_name=OAUTH_CONNECTION_NAME,
+            buttons=[
+                CardAction(
+                    type=ActionTypes.signin,
+                    title="Sign In",
+                    value=sign_in_url
+                )
+            ]
+        )
+        attachment = Attachment(
+            content_type=OAuthCard.content_type, content=oauth_card)
+        await turn_context.send_activity(Activity(attachments=[attachment]))
         return
 
+    # 🔹 If token exists, proceed with your assistant bridge
     access_token = token_response.token
     user_id = turn_context.activity.from_property.aad_object_id
     user_input = turn_context.activity.text
@@ -86,7 +103,7 @@ async def handle_message(turn_context: TurnContext):
     try:
         await turn_context.send_activity(Activity(type="typing"))
 
-        # 🔹 Determine user level via Graph API
+        # Determine user level via Graph API
         level = get_user_group_level(user_id, access_token)
         logging.info(f"User {user_id} is at: {level}")
 
@@ -94,7 +111,6 @@ async def handle_message(turn_context: TurnContext):
             await turn_context.send_activity("You do not have permission to access this bot.")
             return
 
-        # 🔹 Map level → Assistant ID
         assistant_map = {
             "Level 1": "asst_r6q2Ve7DDwrzh0m3n3sbOote",
             "Level 2": "asst_BIOAPR48tzth4k79U4h0cPtu",
@@ -103,7 +119,7 @@ async def handle_message(turn_context: TurnContext):
         }
         assistant_id = assistant_map.get(level)
 
-        # 🔹 Get/create thread
+        # Create or get thread
         thread_id = thread_map.get(user_id)
         if not thread_id:
             thread = openai.beta.threads.create()
@@ -139,15 +155,7 @@ async def handle_message(turn_context: TurnContext):
         logging.error(f"Error handling message: {e}")
         assistant_reply = "Something went wrong."
 
-    await turn_context.send_activity(Activity(
-        type="message",
-        text=assistant_reply,
-        recipient=turn_context.activity.from_property,
-        from_property=turn_context.activity.recipient,
-        conversation=turn_context.activity.conversation,
-        channel_id=turn_context.activity.channel_id,
-        service_url=turn_context.activity.service_url
-    ))
+    await turn_context.send_activity(Activity(type="message", text=assistant_reply))
 
 
 @app.route("/api/messages", methods=["POST"])
