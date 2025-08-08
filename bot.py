@@ -138,6 +138,8 @@ async def handle_message(turn_context: TurnContext):
     }
     assistant_id = assistant_map.get(level)
 
+    logging.info(f"User assign to this assistant: {assistant_id}")
+
     # Create or get thread for user
     user_id = turn_context.activity.from_property.id
     thread_id = thread_map.get(user_id)
