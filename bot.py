@@ -91,7 +91,9 @@ async def handle_message(turn_context: TurnContext):
             ]
         )
         attachment = Attachment(
-            content_type=OAuthCard.content_type, content=oauth_card)
+            content_type="application/vnd.microsoft.card.oauth",  # FIXED for Python
+            content=oauth_card
+        )
         await turn_context.send_activity(Activity(attachments=[attachment]))
         return
 
