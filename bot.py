@@ -8,8 +8,8 @@ from dotenv import load_dotenv
 from flask import Flask, request, Response
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, TurnContext
 from botbuilder.schema import Activity
-from botbuilder.core.teams import TeamsActivityHandler
-from botbuilder.core.oauth import UserTokenClient
+# from botbuilder.core.teams import TeamsActivityHandler
+# from botbuilder.core.oauth import UserTokenClient
 
 # Load environment variables
 load_dotenv()
