@@ -73,8 +73,19 @@ async def handle_message(turn_context: TurnContext):
     if turn_context.activity.type != "message" or not turn_context.activity.text.strip():
         return
 
-    # 🔹 Try to get existing token
-    token_response = await adapter.get_user_token(turn_context, OAUTH_CONNECTION_NAME)
+    # 🔹 Detect magic code from OAuth flow
+    magic_code = None
+    if turn_context.activity.value and "state" in turn_context.activity.value:
+        magic_code = turn_context.activity.value["state"]
+    elif turn_context.activity.text.strip().isdigit():
+        magic_code = turn_context.activity.text.strip()
+
+    # 🔹 Try to get existing token (pass magic_code if present)
+    token_response = await adapter.get_user_token(
+        turn_context,
+        OAUTH_CONNECTION_NAME,
+        magic_code
+    )
 
     if not token_response or not token_response.token:
         # Send OAuthCard Sign-in Button
@@ -91,16 +102,16 @@ async def handle_message(turn_context: TurnContext):
             ]
         )
         attachment = Attachment(
-            content_type="application/vnd.microsoft.card.oauth",  # FIXED for Python
+            content_type="application/vnd.microsoft.card.oauth",
             content=oauth_card
         )
         await turn_context.send_activity(Activity(attachments=[attachment]))
         return
 
-    # 🔹 If token exists, proceed with your assistant bridge
+    # 🔹 If token exists, proceed with assistant bridge
     access_token = token_response.token
     user_id = turn_context.activity.from_property.aad_object_id
-    user_input = turn_context.activity.text
+    user_input = turn_context.activity.text if not magic_code else "start"
 
     try:
         await turn_context.send_activity(Activity(type="typing"))
