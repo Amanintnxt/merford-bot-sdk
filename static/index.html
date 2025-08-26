@@ -5,115 +5,143 @@
     <meta charset="utf-8" />
     <title>Direct Line Streaming — Web Chat</title>
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+            font-family: Arial, Helvetica, sans-serif;
+        }
+
+        #chatContainer {
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #webchat {
+            flex: 1 1 auto;
+        }
+
+        #controls {
+            padding: 10px;
+            background: #f3f3f3;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        button {
+            padding: 8px 12px;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+            background: #fff;
+            cursor: pointer;
+        }
+    </style>
 </head>
 
-<body class="bg-gray-100 flex flex-col h-screen font-sans">
-    <!-- Header -->
-    <header class="bg-blue-600 text-white py-3 px-4 shadow-md flex justify-between items-center">
-        <h1 class="text-lg font-semibold">💬 Bot Chat</h1>
-        <span id="status" class="text-sm bg-blue-500 px-3 py-1 rounded-full">Status: idle</span>
-    </header>
-
-    <!-- Chat container -->
-    <main id="chatContainer"
-        class="flex-1 flex flex-col max-w-3xl w-full mx-auto bg-white shadow-lg border rounded-b-lg overflow-hidden">
-        <div id="controls" class="p-3 border-b flex gap-3 bg-gray-50">
-            <button id="btnStart"
-                class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md text-sm font-medium transition">
-                🔄 Start / Reconnect
-            </button>
+<body>
+    <div id="chatContainer">
+        <div id="controls">
+            <button id="btnStart">Start / Reconnect</button>
+            <span id="status">Status: idle</span>
         </div>
-        <div id="webchat" class="flex-1 overflow-hidden"></div>
-    </main>
+        <div id="webchat" role="main"></div>
+    </div>
 
-    <!-- Microsoft BotFramework WebChat -->
+    <!-- Web Chat CDN (latest stable) -->
     <script src="https://cdn.botframework.com/botframework-webchat/latest/webchat.js"></script>
+
     <script>
+        // Replace this with your server endpoint that returns a Direct Line token (POST).
+        // Example: POST /directline/token  -> returns JSON: { "token": "YOUR_DIRECT_LINE_TOKEN" }
         const DIRECTLINE_TOKEN_ENDPOINT = '/directline/token';
 
         const store = window.WebChat.createStore({}, ({ dispatch }) => next => action => {
+            // You can intercept actions here (optional)
             return next(action);
         });
 
         const startWebChat = async () => {
             document.getElementById('status').innerText = 'Status: requesting token...';
 
-            try {
-                const res = await fetch(DIRECTLINE_TOKEN_ENDPOINT, { method: 'POST' });
-                if (!res.ok) {
-                    document.getElementById('status').innerText = `Status: token request failed (${res.status})`;
-                    console.error('Token request failed:', await res.text());
-                    return;
-                }
-
-                const json = await res.json();
-                const directLineToken = json.token;
-                if (!directLineToken) {
-                    document.getElementById('status').innerText = 'Status: no token in response';
-                    return;
-                }
-
-                document.getElementById('status').innerText = 'Status: token obtained — connecting...';
-
-                const directLine = window.WebChat.createDirectLine({
-                    token: directLineToken,
-                    webSocket: true
-                });
-
-                // Handle connection status
-                directLine.connectionStatus$.subscribe(status => {
-                    const statusMap = {
-                        0: 'Uninitialized',
-                        1: 'Connecting',
-                        2: 'Online ✅',
-                        3: 'Expired token',
-                        4: 'Failed to connect ❌',
-                        5: 'Ended'
-                    };
-                    document.getElementById('status').innerText = `Status: ${statusMap[status] || status}`;
-                });
-
-                // Render WebChat
-                window.WebChat.renderWebChat({
-                    directLine,
-                    userID: 'dl_user_' + Math.floor(Math.random() * 1000000),
-                    username: 'Web Chat User',
-                    store,
-                    sendTyping: true,
-                    styleOptions: {
-                        botAvatarInitials: 'AI',
-                        userAvatarInitials: 'You',
-                        backgroundColor: '#ffffff'
-                    }
-                }, document.getElementById('webchat'));
-
-                // 🔑 Handle OAuthCard for Direct Line
-                directLine.activity$.subscribe(activity => {
-                    if (activity.type === 'message' && activity.attachments) {
-                        activity.attachments.forEach(att => {
-                            if (att.contentType === 'application/vnd.microsoft.card.oauth') {
-                                console.log("OAuthCard received:", att);
-                                const signInUrl = att.content.buttons[0].value;
-                                window.open(signInUrl, '_blank');
-                            }
-                        });
-                    }
-                });
-
-                document.querySelector('#webchat [role="textbox"]')?.focus();
-            } catch (error) {
-                console.error(error);
-                document.getElementById('status').innerText = 'Status: error starting chat';
+            // Request Direct Line token from your server
+            const res = await fetch(DIRECTLINE_TOKEN_ENDPOINT, { method: 'POST' });
+            if (!res.ok) {
+                document.getElementById('status').innerText = `Status: token request failed (${res.status})`;
+                console.error('Token request failed:', await res.text());
+                return;
             }
+
+            const json = await res.json();
+            const directLineToken = json.token;
+            if (!directLineToken) {
+                document.getElementById('status').innerText = 'Status: no token in response';
+                console.error('No token in response', json);
+                return;
+            }
+
+            document.getElementById('status').innerText = 'Status: token obtained — connecting...';
+
+            // Create DirectLine object with WebSocket support (streaming)
+            const directLine = window.WebChat.createDirectLine({
+                token: directLineToken,
+                webSocket: true // enable streaming via WebSocket
+            });
+
+            // Optional: attach event listeners for connection status
+            directLine.connectionStatus$.subscribe(status => {
+                // connectionStatus codes: 0=Uninitialized,1=Connecting,2=Online,3=ExpiredToken,4=FailedToConnect,5=Ended
+                const statusMap = {
+                    0: 'Uninitialized',
+                    1: 'Connecting',
+                    2: 'Online',
+                    3: 'Expired token',
+                    4: 'Failed to connect',
+                    5: 'Ended'
+                };
+                document.getElementById('status').innerText = `Status: ${statusMap[status] || status}`;
+            });
+
+            // Render Web Chat
+            window.WebChat.renderWebChat({
+                directLine,
+                userID: 'dl_user_' + Math.floor(Math.random() * 1000000),
+                username: 'Web Chat User',
+                store,
+                // Enable speech or other features here if you want (but keep simple for now)
+                sendTyping: true,
+                styleOptions: {
+                    botAvatarInitials: 'AI',
+                    userAvatarInitials: 'You'
+                }
+            }, document.getElementById('webchat'));
+
+            // Focus input
+            document.querySelector('#webchat [role="textbox"]')?.focus();
+
+            // Optional: send an initial message to bot (kickoff)
+            // directLine.postActivity({ from: { id: 'dl_user_1' }, type: 'message', text: 'Hello' }).subscribe(
+            //   id => console.log('Posted message, id:', id),
+            //   error => console.error('Post activity error', error)
+            // );
+
+            document.getElementById('status').innerText = 'Status: connected (streaming)';
         };
 
+        // Start / reconnect button
         document.getElementById('btnStart').addEventListener('click', async () => {
+            // Clear previous webchat container
             document.getElementById('webchat').innerHTML = '';
             await startWebChat();
         });
 
-        startWebChat();
+        // Auto-start
+        startWebChat().catch(err => {
+            console.error(err);
+            document.getElementById('status').innerText = 'Status: error starting chat';
+        });
     </script>
 </body>
 

@@ -66,7 +66,6 @@ def get_user_group_level(access_token):
             return "Level 3"
         elif name == "Level4Access":
             return "Level 4"
-
     return None
 
 # ---------------------------
@@ -99,7 +98,9 @@ async def handle_message(turn_context: TurnContext):
 
     # Try to get token
     token_response = await adapter.get_user_token(
-        turn_context, OAUTH_CONNECTION_NAME, magic_code
+        turn_context,
+        OAUTH_CONNECTION_NAME,
+        magic_code
     )
 
     if not token_response or not token_response.token:
@@ -109,8 +110,11 @@ async def handle_message(turn_context: TurnContext):
             text="Please sign in to continue.",
             connection_name=OAUTH_CONNECTION_NAME,
             buttons=[
-                CardAction(type=ActionTypes.signin,
-                           title="Sign In", value=sign_in_url)
+                CardAction(
+                    type=ActionTypes.signin,
+                    title="Sign In",
+                    value=sign_in_url
+                )
             ]
         )
         attachment = Attachment(
@@ -123,16 +127,16 @@ async def handle_message(turn_context: TurnContext):
     # We have a valid token
     access_token = token_response.token
 
-    # If user just signed in, greet them
+    # If user just signed in, greet them and don't call assistant yet
     if user_id not in signed_in_users:
         signed_in_users[user_id] = access_token
         await turn_context.send_activity("🔐 Sign-in successful! You can now ask your questions.")
         return
 
-    # Get group level
     level = get_user_group_level(access_token)
+    logging.info(f"User is at: {level}")
+
     if not level:
-        logging.warning("User has no matching group access level")
         await turn_context.send_activity("You do not have permission to access this bot.")
         return
 
@@ -143,14 +147,9 @@ async def handle_message(turn_context: TurnContext):
         "Level 3": "asst_SLWGUNXMQrmzpJIN1trU0zSX",
         "Level 4": "asst_s1OefDDIgDVpqOgfp5pfCpV1"
     }
-
     assistant_id = assistant_map.get(level)
-    if not assistant_id:
-        logging.error(f"No assistant mapping found for {level}")
-        await turn_context.send_activity("❌ No assistant available for your access level.")
-        return
 
-    logging.info(f"User is in {level} → Assigned assistant: {assistant_id}")
+    logging.info(f"User assigned to assistant: {assistant_id}")
 
     # Create or get thread for user
     thread_id = thread_map.get(user_id)
@@ -159,7 +158,7 @@ async def handle_message(turn_context: TurnContext):
         thread_id = thread.id
         thread_map[user_id] = thread_id
 
-    # Add user message
+    # Add user message to thread
     openai.beta.threads.messages.create(
         thread_id=thread_id,
         role="user",
@@ -173,14 +172,16 @@ async def handle_message(turn_context: TurnContext):
         )
     except Exception as e:
         logging.error(f"Failed to create run: {e}")
-        await turn_context.send_activity("❌ Something went wrong while connecting to the assistant.")
+        await turn_context.send_activity("Something went wrong while connecting to the assistant.")
         return
 
-    # Wait until completion
+    # Wait for completion
     while run.status not in ["completed", "failed", "cancelled"]:
         time.sleep(1)
         run = openai.beta.threads.runs.retrieve(
-            thread_id=thread_id, run_id=run.id)
+            thread_id=thread_id,
+            run_id=run.id
+        )
 
     # Fetch assistant reply
     messages = openai.beta.threads.messages.list(thread_id=thread_id)
@@ -191,9 +192,12 @@ async def handle_message(turn_context: TurnContext):
             break
 
     if not assistant_reply:
-        assistant_reply = "❌ Assistant did not return a reply."
+        assistant_reply = "Sorry, I didn't get a reply from the assistant."
 
-    await turn_context.send_activity(Activity(type="message", text=assistant_reply))
+    await turn_context.send_activity(Activity(
+        type="message",
+        text=assistant_reply
+    ))
 
 # ---------------------------
 # Flask Endpoints
@@ -234,10 +238,8 @@ def directline_token():
     url = "https://directline.botframework.com/v3/directline/tokens/generate"
     headers = {"Authorization": f"Bearer {DIRECT_LINE_SECRET}"}
     resp = requests.post(url, headers=headers)
-
     if resp.status_code != 200:
         return jsonify({"error": "Failed to generate token", "details": resp.text}), 500
-
     return jsonify({"token": resp.json().get("token")})
 
 
