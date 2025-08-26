@@ -36,7 +36,7 @@ thread_map = {}
 signed_in_users = {}
 
 # ---------------------------
-# Helper: Get user group level from Microsoft Graph using /me
+# Helper: Get user group level
 # ---------------------------
 
 
@@ -44,20 +44,16 @@ def get_user_group_level(access_token):
     """Get the user's group level using /me/memberOf."""
     url = "https://graph.microsoft.com/v1.0/me/memberOf?$select=id,displayName"
     headers = {"Authorization": f"Bearer {access_token}"}
-    logging.info("Fetching group membership for signed-in user via /me")
-
     response = requests.get(url, headers=headers)
+
     if response.status_code != 200:
         logging.warning(
             f"Group lookup failed: {response.status_code} - {response.text}")
         return None
 
     groups = response.json().get("value", [])
-    logging.info(f"Found {len(groups)} groups")
-
     for group in groups:
         name = group.get("displayName")
-        logging.info(f" - Group: {name}")
         if name == "Level1Access":
             return "Level 1"
         elif name == "Level2Access":
@@ -89,19 +85,14 @@ async def handle_message(turn_context: TurnContext):
     if turn_context.activity.type != "message" or not turn_context.activity.text.strip():
         return
 
-    # Detect magic code (from OAuth flow)
+    # Handle OAuth
     magic_code = None
     if turn_context.activity.value and "state" in turn_context.activity.value:
         magic_code = turn_context.activity.value["state"]
     elif turn_context.activity.text and turn_context.activity.text.strip().isdigit():
         magic_code = turn_context.activity.text.strip()
 
-    # Try to get token
-    token_response = await adapter.get_user_token(
-        turn_context,
-        OAUTH_CONNECTION_NAME,
-        magic_code
-    )
+    token_response = await adapter.get_user_token(turn_context, OAUTH_CONNECTION_NAME, magic_code)
 
     if not token_response or not token_response.token:
         # Ask user to sign in
@@ -109,81 +100,67 @@ async def handle_message(turn_context: TurnContext):
         oauth_card = OAuthCard(
             text="Please sign in to continue.",
             connection_name=OAUTH_CONNECTION_NAME,
-            buttons=[
-                CardAction(
-                    type=ActionTypes.signin,
-                    title="Sign In",
-                    value=sign_in_url
-                )
-            ]
+            buttons=[CardAction(type=ActionTypes.signin,
+                                title="Sign In", value=sign_in_url)],
         )
         attachment = Attachment(
-            content_type="application/vnd.microsoft.card.oauth",
-            content=oauth_card
-        )
+            content_type="application/vnd.microsoft.card.oauth", content=oauth_card)
         await turn_context.send_activity(Activity(attachments=[attachment]))
         return
 
-    # We have a valid token
+    # Store token
     access_token = token_response.token
-
-    # If user just signed in, greet them and don't call assistant yet
     if user_id not in signed_in_users:
         signed_in_users[user_id] = access_token
         await turn_context.send_activity("🔐 Sign-in successful! You can now ask your questions.")
         return
 
+    # Get user level
     level = get_user_group_level(access_token)
-    logging.info(f"User is at: {level}")
-
     if not level:
-        await turn_context.send_activity("You do not have permission to access this bot.")
+        await turn_context.send_activity("❌ Error: You do not have permission to access this bot.")
         return
 
-    # Assistant mapping
+    # Map assistant
     assistant_map = {
         "Level 1": "asst_r6q2Ve7DDwrzh0m3n3sbOote",
         "Level 2": "asst_BIOAPR48tzth4k79U4h0cPtu",
         "Level 3": "asst_SLWGUNXMQrmzpJIN1trU0zSX",
-        "Level 4": "asst_s1OefDDIgDVpqOgfp5pfCpV1"
+        "Level 4": "asst_s1OefDDIgDVpqOgfp5pfCpV1",
     }
     assistant_id = assistant_map.get(level)
 
-    logging.info(f"User assigned to assistant: {assistant_id}")
+    if not assistant_id:
+        await turn_context.send_activity("❌ Error: No assistant assigned for your access level.")
+        return
 
-    # Create or get thread for user
+    # Thread per user
     thread_id = thread_map.get(user_id)
     if not thread_id:
         thread = openai.beta.threads.create()
         thread_id = thread.id
         thread_map[user_id] = thread_id
 
-    # Add user message to thread
+    # Add message
     openai.beta.threads.messages.create(
-        thread_id=thread_id,
-        role="user",
-        content=turn_context.activity.text
+        thread_id=thread_id, role="user", content=turn_context.activity.text
     )
 
     try:
         run = openai.beta.threads.runs.create(
-            assistant_id=assistant_id,
-            thread_id=thread_id
-        )
+            assistant_id=assistant_id, thread_id=thread_id)
     except Exception as e:
-        logging.error(f"Failed to create run: {e}")
-        await turn_context.send_activity("Something went wrong while connecting to the assistant.")
+        logging.error(f"Run creation failed: {e}")
+        await turn_context.send_activity("❌ Error: Failed to connect to assistant.")
         return
 
     # Wait for completion
     while run.status not in ["completed", "failed", "cancelled"]:
         time.sleep(1)
         run = openai.beta.threads.runs.retrieve(
-            thread_id=thread_id,
-            run_id=run.id
-        )
+            thread_id=thread_id, run_id=run.id)
 
-    # Fetch assistant reply
+    # Get reply
     messages = openai.beta.threads.messages.list(thread_id=thread_id)
     assistant_reply = None
     for msg in messages.data:
@@ -192,12 +169,9 @@ async def handle_message(turn_context: TurnContext):
             break
 
     if not assistant_reply:
-        assistant_reply = "Sorry, I didn't get a reply from the assistant."
+        assistant_reply = "❌ Error: Assistant did not return a response."
 
-    await turn_context.send_activity(Activity(
-        type="message",
-        text=assistant_reply
-    ))
+    await turn_context.send_activity(Activity(type="message", text=assistant_reply))
 
 # ---------------------------
 # Flask Endpoints
@@ -209,7 +183,6 @@ def messages():
     try:
         if "application/json" not in request.headers.get("Content-Type", ""):
             return Response("Unsupported Media Type", status=415)
-
         activity = Activity().deserialize(request.json)
         auth_header = request.headers.get("Authorization", "")
 
@@ -218,7 +191,6 @@ def messages():
 
         asyncio.run(process())
         return Response(status=200)
-
     except Exception as e:
         logging.error(f"Exception in /api/messages: {e}")
         return Response("Internal Server Error", status=500)
@@ -234,7 +206,6 @@ def directline_token():
     """Generates a Direct Line token using your secret."""
     if not DIRECT_LINE_SECRET:
         return jsonify({"error": "DIRECT_LINE_SECRET not set"}), 500
-
     url = "https://directline.botframework.com/v3/directline/tokens/generate"
     headers = {"Authorization": f"Bearer {DIRECT_LINE_SECRET}"}
     resp = requests.post(url, headers=headers)

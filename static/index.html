@@ -3,7 +3,7 @@
 
 <head>
     <meta charset="utf-8" />
-    <title>Direct Line Streaming — Web Chat</title>
+    <title>Direct Line — Web Chat</title>
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
@@ -38,7 +38,21 @@
     <script>
         const DIRECTLINE_TOKEN_ENDPOINT = '/directline/token';
 
+        // 🔹 Custom store to filter only assistant + user messages
         const store = window.WebChat.createStore({}, ({ dispatch }) => next => action => {
+            if (action.type === 'DIRECT_LINE/INCOMING_ACTIVITY') {
+                const activity = action.payload.activity;
+
+                // Allow only bot messages and user messages, ignore system events
+                if (activity.type !== 'message') {
+                    return;
+                }
+
+                // Ensure empty/fancy responses don’t pass
+                if (!activity.text || activity.text.trim() === '') {
+                    return;
+                }
+            }
             return next(action);
         });
 
@@ -80,6 +94,7 @@
                     document.getElementById('status').innerText = `Status: ${statusMap[status] || status}`;
                 });
 
+                // Render chat
                 window.WebChat.renderWebChat({
                     directLine,
                     userID: 'dl_user_' + Math.floor(Math.random() * 1000000),
@@ -89,7 +104,10 @@
                     styleOptions: {
                         botAvatarInitials: 'AI',
                         userAvatarInitials: 'You',
-                        backgroundColor: '#ffffff'
+                        backgroundColor: '#ffffff',
+                        bubbleBorderRadius: 10,
+                        botAvatarBackgroundColor: '#2563eb',
+                        userAvatarBackgroundColor: '#10b981'
                     }
                 }, document.getElementById('webchat'));
 
