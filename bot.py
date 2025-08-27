@@ -142,7 +142,7 @@ async def handle_message(turn_context: TurnContext):
 
     logging.info(f"User assigned to assistant: {assistant_id}")
     if not assistant_id:
-        await turn_context.send_activity("❌ Assistant not found for your access level.")
+        await turn_context.send_activity("❌ Assistant not found for your access level")
         return
 
     # 5️⃣  Create / reuse a thread dedicated to this assistant+user
