@@ -174,9 +174,10 @@ async def handle_message(turn_context: TurnContext):
         run = openai.beta.threads.runs.create(
             assistant_id=assistant_id,
             thread_id=thread_id,
-            tool_choice={"type": "file_search"},      # must use retrieval
-            tool_resources={
+            tool_choice={"type": "file_search"},        # enforce retrieval
+            tool_resources={                                 # v2 feature
                 "file_search": {
+                    # level-specific store
                     "vector_store_ids": [vector_store_id]
                 }
             },
