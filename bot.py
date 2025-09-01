@@ -227,7 +227,7 @@ async def handle_activity(turn_context: TurnContext):
         logging.info("Received invoke: %s", a.name)
         token = await try_get_token(turn_context)
         if token:
-            await turn_context.send_activity("🔐 You're signed in. Ask your question!")
+            await turn_context.send_activity("🔐 You're signed in. Ask your question")
         return  # ⚠️ No Response object here
 
     # 3) Regular messages only
