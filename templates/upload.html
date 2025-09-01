@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Upload PDF</title>
+</head>
+
+<body>
+    <h2>Upload PDF to Vector Store</h2>
+    <form action="/upload" method="post" enctype="multipart/form-data">
+        <label>Select Access Level:</label><br>
+        <input type="radio" name="level" value="Level 1" required> Level 1<br>
+        <input type="radio" name="level" value="Level 2"> Level 2<br>
+        <input type="radio" name="level" value="Level 3"> Level 3<br>
+        <input type="radio" name="level" value="Level 4"> Level 4<br><br>
+
+        <input type="file" name="file" accept="application/pdf" required><br><br>
+        <button type="submit">Upload</button>
+    </form>
+</body>
+
+</html>
