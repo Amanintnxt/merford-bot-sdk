@@ -14,7 +14,7 @@ from botbuilder.schema import Activity, Attachment, CardAction, ActionTypes, OAu
 from PyPDF2 import PdfReader
 from openai import AzureOpenAI
 
-# ─────────────────────────  ENV & OPENAI CONFIG  ─────────────────────────────
+# ─────────────────────────  ENV & OPENAI CONFIG  ────────────────────────────
 load_dotenv()
 
 APP_ID = os.getenv("MicrosoftAppId", "")
