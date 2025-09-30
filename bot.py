@@ -37,8 +37,8 @@ client = AzureOpenAI(
 )
 
 # ─────────────────────────  LOGGING  ─────────────────────────────────────────
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s  %(levelname)-7s %(message)s")
+# logging.basicConfig(level=logging.INFO,
+#                     format="%(asctime)s  %(levelname)-7s %(message)s")
 
 # ─────────────────────────  ASSISTANT IDS (exact!)  ──────────────────────────
 ASSISTANT_MAP = {
@@ -58,6 +58,9 @@ VECTOR_STORES = {
 
 # ─────────────────────────  FLASK & BOT ADAPTER  ─────────────────────────────
 app = Flask(__name__, static_folder="static", template_folder="templates")
+# sync Flask logger
+app.logger.handlers = logging.getLogger().handlers
+app.logger.setLevel(logging.INFO)
 adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
 adapter = BotFrameworkAdapter(adapter_settings)
 
@@ -346,4 +349,13 @@ def health():
 
 # ─────────────────────────  MAIN  ────────────────────────────────────────────
 if __name__ == "__main__":
+    logging.info("🚀 Bot is starting on Render...")
+    logging.info("🔧 Environment check:")
+    logging.info("  MicrosoftAppId: %s", "SET" if APP_ID else "MISSING")
+    logging.info("  Azure OpenAI Endpoint: %s", AZURE_OPENAI_EP or "MISSING")
+    logging.info("  OAuth Connection: %s", OAUTH_CONNECTION or "MISSING")
+    logging.info("  Direct Line Secret: %s",
+                 "SET" if DIRECT_LINE_SECRET else "MISSING")
+    logging.info("  Admin Secret: %s", "SET" if ADMIN_SECRET else "NOT SET")
+
     app.run(host="0.0.0.0", port=3978)
