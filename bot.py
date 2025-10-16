@@ -1,3 +1,4 @@
+
 # ──────────────────────────────────────────────────────────────────────────────
 # bot.py – Teams / Direct Line bridge to Azure OpenAI Assistants (SSO-first)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -10,7 +11,7 @@ import openai
 from dotenv import load_dotenv
 from flask import Flask, request, Response, jsonify, send_from_directory, render_template
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, TurnContext
-from botbuilder.schema import Activity, Attachment, CardAction, ActionTypes, OAuthCard
+from botbuilder.schema import Activity, Attachment, CardAction, ActionTypes, OAuthCard, SuggestedActions
 from PyPDF2 import PdfReader
 from openai import AzureOpenAI
 
@@ -66,6 +67,31 @@ adapter = BotFrameworkAdapter(adapter_settings)
 
 # ─────────────────────────  IN-MEMORY STATE  ────────────────────────────────
 thread_map = {}        # key = f"{user_id}:{assistant_id}" → thread_id
+awaiting_clarification = set()  # user_ids awaiting a reply to CLARIFY
+
+# ─────────────────────────  CLARIFY HELPERS  ────────────────────────────────
+
+
+def _is_clarify(text: str) -> bool:
+    return bool(text and text.strip().upper().startswith("CLARIFY:"))
+
+
+def _strip_clarify(text: str) -> str:
+    return text[len("CLARIFY:"):].strip() if _is_clarify(text) else (text or "")
+
+
+def _clarify_actions(question_text: str):
+    """Build quick replies based on the clarify question."""
+    lower = (question_text or "").lower()
+    if "model" in lower or "product" in lower:
+        opts = ["Model: M-series", "Model: Unknown", "Provide model later"]
+    elif "ticket" in lower or "report" in lower:
+        opts = ["Ticket: 1234", "Report: EXAP-…", "No ticket"]
+    elif "configuration" in lower:
+        opts = ["Single leaf", "Double leaf", "Not sure"]
+    else:
+        opts = ["I will specify", "Please show options", "Cancel"]
+    return [CardAction(type=ActionTypes.im_back, title=o, value=o) for o in opts]
 
 # ─────────────────────────  GRAPH LOOK-UP  ───────────────────────────────────
 
@@ -264,8 +290,16 @@ async def handle_activity(turn_context: TurnContext):
 
     # 7) Add user message
     if user_text and not user_text.isdigit():
+        # If this is a follow-up to a CLARIFY, tag it and clear the flag
+        message_content = user_text
+        if user_id in awaiting_clarification:
+            logging.info("↩️ Clarification received from %s: %s",
+                         user_id, user_text)
+            message_content = f"(User clarification) {user_text}"
+            awaiting_clarification.discard(user_id)
+
         openai.beta.threads.messages.create(
-            thread_id=thread_id, role="user", content=user_text
+            thread_id=thread_id, role="user", content=message_content
         )
 
     # 8) Run assistant
@@ -298,6 +332,19 @@ async def handle_activity(turn_context: TurnContext):
     except Exception:
         logging.exception("Fetch messages failed")
         reply = None
+
+    # 9.1) Clarify-first handling
+    if reply and _is_clarify(reply):
+        question = _strip_clarify(reply)
+        logging.info("🟡 CLARIFY triggered for %s: %s", user_id, question)
+        awaiting_clarification.add(user_id)
+        await turn_context.send_activity(Activity(
+            type="message",
+            text=question,
+            suggested_actions=SuggestedActions(
+                actions=_clarify_actions(question))
+        ))
+        return
 
     await turn_context.send_activity(reply or "❌ No reply from assistant.")
 
