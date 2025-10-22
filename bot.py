@@ -85,17 +85,51 @@ def _strip_clarify(text: str) -> str:
 
 
 def _clarify_actions(question: str):
-    """Generate context-aware quick replies."""
+    """
+    Dynamically generate clarifying options based on the question text.
+    Uses lightweight heuristic extraction + fallback defaults.
+    """
+    if not question:
+        return [CardAction(type=ActionTypes.im_back, title="I'll specify", value="I'll specify")]
+
     lower = question.lower()
-    if "model" in lower or "product" in lower:
-        opts = ["Model: M-series", "Model: Unknown", "Provide model later"]
-    elif "configuration" in lower:
-        opts = ["Single leaf", "Double leaf", "Not sure"]
-    elif "zone" in lower:
-        opts = ["Zone 2 IIB T2", "Other zone", "Not sure"]
+
+    # Heuristic keywords → dynamic options
+    if "model" in lower or "type" in lower or "product" in lower:
+        opts = ["Specify model", "Not sure of model", "Any model"]
+    elif "test" in lower or "report" in lower or "certificate" in lower:
+        opts = ["EXAP report", "EN test", "Not applicable"]
+    elif "zone" in lower or "atex" in lower:
+        opts = ["Zone 1 IIB T3", "Zone 2 IIB T2", "Not sure"]
+    elif "configuration" in lower or "leaf" in lower:
+        opts = ["Single leaf", "Double leaf", "Unsure"]
+    elif "material" in lower or "panel" in lower:
+        opts = ["Steel", "Aluminium", "Composite", "Other"]
+    elif "fire" in lower or "insulation" in lower:
+        opts = ["EI₆₀", "EI₉₀", "Not specified"]
     else:
-        opts = ["I'll specify", "Please repeat question", "Cancel"]
-    return [CardAction(type=ActionTypes.im_back, title=o, value=o) for o in opts]
+        # Try to infer options dynamically using a small local LLM call
+        try:
+            completion = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You generate 2-4 short multiple-choice options to help clarify the user's question. Output them as a comma-separated list."},
+                    {"role": "user", "content": question}
+                ],
+                max_tokens=50,
+                temperature=0.4
+            )
+            text = completion.choices[0].message.content
+            opts = [opt.strip() for opt in text.split(",") if opt.strip()]
+        except Exception:
+            opts = []
+
+    # Always ensure fallback options
+    if not opts:
+        opts = ["I'll specify", "Please clarify", "Cancel"]
+
+    # Return card buttons
+    return [CardAction(type=ActionTypes.im_back, title=o, value=o) for o in opts[:4]]
 
 
 def _needs_followup_clarify(user_text: str, reply: str) -> bool:
