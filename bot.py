@@ -271,6 +271,11 @@ def health():
     return "Bot is running with Clarify logic."
 
 
+@app.route("/chat", methods=["GET"])
+def chat():
+    return send_from_directory(app.static_folder, "index.html")
+
+
 # ─────────────────────────  MAIN  ────────────────────────────────────────────
 if __name__ == "__main__":
     logging.info("🚀 Bot started with dynamic CLARIFY logic.")
