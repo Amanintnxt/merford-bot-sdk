@@ -255,20 +255,40 @@ async def handle_activity(turn_context: TurnContext):
 
     await turn_context.send_activity(reply or "No reply received.")
 
-# ─────────────────────────  ROUTES  ──────────────────────────────────────────
+# ─────────────────────────  FLASK ROUTES  ────────────────────────────────────
 
 
 @app.route("/api/messages", methods=["POST"])
 def messages():
-    activity = Activity().deserialize(request.json)
-    auth_hdr = request.headers.get("Authorization", "")
-    asyncio.run(adapter.process_activity(activity, auth_hdr, handle_activity))
-    return Response(status=200)
+    try:
+        if "application/json" not in request.headers.get("Content-Type", ""):
+            return Response("Unsupported Media Type", 415)
+        activity = Activity().deserialize(request.json)
+        auth_hdr = request.headers.get("Authorization", "")
+
+        async def _proc():
+            return await adapter.process_activity(activity, auth_hdr, handle_activity)
+
+        asyncio.run(_proc())
+        return Response(status=200)
+    except Exception as ex:
+        logging.exception("Exception in /api/messages: %s", ex)
+        return Response("Internal Server Error", 500)
 
 
-@app.route("/", methods=["GET"])
-def health():
-    return "Bot is running with Clarify logic."
+@app.route("/directline/token", methods=["POST"])
+def directline_token():
+    if not DIRECT_LINE_SECRET:
+        return jsonify({"error": "DIRECT_LINE_SECRET not set"}), 500
+    r = requests.post(
+        "https://directline.botframework.com/v3/directline/tokens/generate",
+        headers={"Authorization": f"Bearer {DIRECT_LINE_SECRET}"},
+        timeout=10
+    )
+    if r.status_code != 200:
+        logging.error("Direct Line token generation failed: %s", r.text)
+        return jsonify({"error": "Failed to generate token"}), 500
+    return jsonify({"token": r.json().get("token")})
 
 
 @app.route("/chat", methods=["GET"])
@@ -276,7 +296,20 @@ def chat():
     return send_from_directory(app.static_folder, "index.html")
 
 
+@app.route("/", methods=["GET"])
+def health():
+    return "Bot is running."
+
+
 # ─────────────────────────  MAIN  ────────────────────────────────────────────
 if __name__ == "__main__":
-    logging.info("🚀 Bot started with dynamic CLARIFY logic.")
+    logging.info("🚀 Bot is starting on Render...")
+    logging.info("🔧 Environment check:")
+    logging.info("  MicrosoftAppId: %s", "SET" if APP_ID else "MISSING")
+    logging.info("  Azure OpenAI Endpoint: %s", AZURE_OPENAI_EP or "MISSING")
+    logging.info("  OAuth Connection: %s", OAUTH_CONNECTION or "MISSING")
+    logging.info("  Direct Line Secret: %s",
+                 "SET" if DIRECT_LINE_SECRET else "MISSING")
+    logging.info("  Admin Secret: %s", "SET" if ADMIN_SECRET else "NOT SET")
+
     app.run(host="0.0.0.0", port=3978)
