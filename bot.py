@@ -84,51 +84,67 @@ def _strip_clarify(text: str) -> str:
     return text[len("CLARIFY:"):].strip() if _is_clarify(text) else text
 
 
-def _clarify_actions(question: str):
+def _clarify_actions(question: str, assistant_id: str = None, thread_id: str = None):
     """
-    Dynamically generate clarifying options based on the question text.
-    Uses lightweight heuristic extraction + fallback defaults.
+    Dynamically generate clarifying options grounded in the Assistant's knowledge base.
+    If no good hints are in the KB, fallback to default heuristic or minimal options.
     """
-    if not question:
-        return [CardAction(type=ActionTypes.im_back, title="I'll specify", value="I'll specify")]
-
     lower = question.lower()
 
-    # Heuristic keywords → dynamic options
-    if "model" in lower or "type" in lower or "product" in lower:
+    # Heuristic fallback (still useful if KB doesn’t help)
+    if "model" in lower or "product" in lower:
         opts = ["Specify model", "Not sure of model", "Any model"]
-    elif "test" in lower or "report" in lower or "certificate" in lower:
+    elif "report" in lower or "certificate" in lower:
         opts = ["EXAP report", "EN test", "Not applicable"]
+    elif "configuration" in lower:
+        opts = ["Single leaf", "Double leaf", "Not sure"]
     elif "zone" in lower or "atex" in lower:
         opts = ["Zone 1 IIB T3", "Zone 2 IIB T2", "Not sure"]
-    elif "configuration" in lower or "leaf" in lower:
-        opts = ["Single leaf", "Double leaf", "Unsure"]
-    elif "material" in lower or "panel" in lower:
-        opts = ["Steel", "Aluminium", "Composite", "Other"]
-    elif "fire" in lower or "insulation" in lower:
-        opts = ["EI₆₀", "EI₉₀", "Not specified"]
     else:
-        # Try to infer options dynamically using a small local LLM call
-        try:
-            completion = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You generate 2-4 short multiple-choice options to help clarify the user's question. Output them as a comma-separated list."},
-                    {"role": "user", "content": question}
-                ],
-                max_tokens=50,
-                temperature=0.4
+        opts = []
+
+    # 🧠 Ask the Assistant itself for context-aware options
+    try:
+        if assistant_id and thread_id:
+            run = openai.beta.threads.runs.create(
+                assistant_id=assistant_id,
+                thread_id=thread_id,
+                instructions=(
+                    "Generate 2–4 short multiple-choice clarification options "
+                    "based ONLY on information from your knowledge base (vector data). "
+                    "If unsure, say 'Cannot determine options from documents'. "
+                    "Question: " + question
+                ),
+                tool_choice={"type": "file_search"}
             )
-            text = completion.choices[0].message.content
-            opts = [opt.strip() for opt in text.split(",") if opt.strip()]
-        except Exception:
-            opts = []
 
-    # Always ensure fallback options
+            # Wait until the assistant finishes
+            start = time.time()
+            while run.status not in ["completed", "failed", "cancelled"]:
+                time.sleep(0.5)
+                run = openai.beta.threads.runs.retrieve(
+                    thread_id=thread_id,
+                    run_id=run.id
+                )
+
+            messages = openai.beta.threads.messages.list(
+                thread_id=thread_id, order="desc", limit=3)
+            answer = next(
+                (m.content[0].text.value for m in messages.data if m.role ==
+                 "assistant"), ""
+            )
+
+            if answer and "cannot determine" not in answer.lower():
+                kb_opts = [o.strip(" -•")
+                           for o in answer.split("\n") if len(o.strip()) > 2]
+                opts.extend(kb_opts[:4])
+    except Exception as e:
+        logging.warning("Dynamic clarify options generation failed: %s", e)
+
+    # Ensure minimal fallback options
     if not opts:
-        opts = ["I'll specify", "Please clarify", "Cancel"]
+        opts = ["I'll specify", "Please repeat question", "Cancel"]
 
-    # Return card buttons
     return [CardAction(type=ActionTypes.im_back, title=o, value=o) for o in opts[:4]]
 
 
