@@ -1,5 +1,6 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# bot.py – Simplified version with smart CLARIFY logic (no action cards)
+# bot.py – Teams / Direct Line bridge to Azure OpenAI Assistants (SSO-first)
+# Optimized version with dynamic CLARIFY logic and SSO magic code fix
 # ──────────────────────────────────────────────────────────────────────────────
 import os
 import asyncio
@@ -10,7 +11,7 @@ import openai
 from dotenv import load_dotenv
 from flask import Flask, request, Response, jsonify, send_from_directory, render_template
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, TurnContext
-from botbuilder.schema import Activity, Attachment, OAuthCard, ActionTypes
+from botbuilder.schema import Activity, Attachment, CardAction, ActionTypes, OAuthCard, SuggestedActions
 from PyPDF2 import PdfReader
 from openai import AzureOpenAI
 
@@ -60,32 +61,63 @@ adapter = BotFrameworkAdapter(adapter_settings)
 thread_map = {}              # user_id:assistant_id → thread_id
 awaiting_clarification = set()  # track users awaiting clarification reply
 
+# ──────────────── CLARIFY LOGIC HELPERS ────────────────
 
-# ──────────────── CLARIFY HELPERS ────────────────
+
 def _is_clarify(text: str) -> bool:
-    """Detect if assistant message explicitly requests clarification."""
+    return bool(text and text.strip().upper().startswith("CLARIFY:"))
+
+
+def _looks_like_clarify(text: str) -> bool:
+    """Detect if assistant message is probably a clarifying question."""
     if not text:
         return False
     t = text.strip().lower()
-    return t.startswith("clarify:") or (t.endswith("?") and len(t) < 200)
+    if "?" not in t:
+        return False
+    starts = ("what", "which", "can you", "could you",
+              "please", "clarify", "do you")
+    return any(t.startswith(s) for s in starts) and len(t) < 200
 
 
 def _strip_clarify(text: str) -> str:
-    return text[len("CLARIFY:"):].strip() if text.upper().startswith("CLARIFY:") else text
+    return text[len("CLARIFY:"):].strip() if _is_clarify(text) else text
 
 
-def _needs_followup(user_text: str, reply: str) -> bool:
-    """Detect vague answers that need a follow-up clarification."""
+def _clarify_actions(question: str):
+    """Generate context-aware quick replies."""
+    lower = question.lower()
+    if "model" in lower or "type" in lower or "product" in lower:
+        opts = ["Specify model", "Not sure of model", "Any model"]
+    elif "test" in lower or "report" in lower or "certificate" in lower:
+        opts = ["EXAP report", "EN test", "Not applicable"]
+    elif "zone" in lower or "atex" in lower:
+        opts = ["Zone 1 IIB T3", "Zone 2 IIB T2", "Not sure"]
+    elif "configuration" in lower or "leaf" in lower:
+        opts = ["Single leaf", "Double leaf", "Unsure"]
+    elif "material" in lower or "panel" in lower:
+        opts = ["Steel", "Aluminium", "Composite", "Other"]
+    else:
+        opts = ["I'll specify", "Please repeat question", "Cancel"]
+    return [CardAction(type=ActionTypes.im_back, title=o, value=o) for o in opts]
+
+
+def _needs_followup_clarify(user_text: str, reply: str) -> bool:
+    """Trigger extra clarification if answer looks too generic."""
     if not reply:
         return False
-    vague_words = ["depends", "may vary", "different options",
-                   "it can be", "varies", "recommended"]
-    ambiguous = any(w in user_text.lower()
-                    for w in ["which", "what kind", "can we", "how about", "option"])
-    return ambiguous and any(v in reply.lower() for v in vague_words)
-
+    ut, rp = user_text.lower(), reply.lower()
+    ambiguous = any(k in ut for k in ("what if", "can we",
+                    "options", "model", "alternative", "configuration"))
+    generic = any(k in rp for k in ("may", "depends",
+                  "options", "can be", "recommended", "varies"))
+    bullets = sum(1 for l in reply.splitlines()
+                  if l.strip().startswith(("-", "*", "1.")))
+    return ambiguous and (generic or bullets >= 3)
 
 # ──────────────── GRAPH LOOKUP ────────────────
+
+
 def get_user_group_level(token: str) -> str | None:
     url = "https://graph.microsoft.com/v1.0/me/memberOf?$select=displayName"
     headers = {"Authorization": f"Bearer {token}"}
@@ -107,8 +139,9 @@ def get_user_group_level(token: str) -> str | None:
         return None
     return None
 
+# ──────────────── PDF UPLOAD ROUTE ────────────────
 
-# ──────────────── PDF UPLOAD ROUTE (unchanged) ────────────────
+
 def is_pdf_text_based(path, min_len=10):
     try:
         text = "".join([p.extract_text() or "" for p in PdfReader(path).pages])
@@ -155,8 +188,9 @@ def upload_file():
             os.remove(path)
     return render_template("upload.html")
 
-
 # ──────────────── TOKEN HELPERS ────────────────
+
+
 async def try_get_token(turn_context: TurnContext, magic_code=None):
     try:
         return await adapter.get_user_token(turn_context, OAUTH_CONNECTION, magic_code)
@@ -176,8 +210,8 @@ async def ensure_token(turn_context: TurnContext):
     card = OAuthCard(
         text="Please sign in to continue.",
         connection_name=OAUTH_CONNECTION,
-        buttons=[{"type": ActionTypes.signin,
-                  "title": "Sign In", "value": url}],
+        buttons=[CardAction(type=ActionTypes.signin,
+                            title="Sign In", value=url)],
     )
     await turn_context.send_activity(Activity(
         attachments=[Attachment(
@@ -185,8 +219,9 @@ async def ensure_token(turn_context: TurnContext):
     ))
     return None
 
-
 # ──────────────── CORE BOT HANDLER ────────────────
+
+
 async def handle_activity(turn_context: TurnContext):
     a = turn_context.activity
     user_id = a.from_property.id
@@ -204,6 +239,7 @@ async def handle_activity(turn_context: TurnContext):
 
     # 2️⃣ Detect OAuth magic code
     if user_text.isdigit() and len(user_text) <= 10:
+        logging.info(f"🔐 OAuth magic code detected: {user_text}")
         token = await try_get_token(turn_context, user_text)
         if token and token.token:
             await turn_context.send_activity("🔓 Sign-in successful! You can now ask your question.")
@@ -253,29 +289,41 @@ async def handle_activity(turn_context: TurnContext):
         run = openai.beta.threads.runs.retrieve(
             thread_id=thread_id, run_id=run.id)
 
-    # 7️⃣ Get assistant reply
+    # 7️⃣ Get reply
     msgs = openai.beta.threads.messages.list(
         thread_id=thread_id, order="desc", limit=5)
     reply = next(
         (m.content[0].text.value for m in msgs.data if m.role == "assistant"), None)
 
-    # 8️⃣ Handle clarification
-    if reply and _is_clarify(reply):
+    # 8️⃣ Clarify handling
+    if reply and (_is_clarify(reply) or _looks_like_clarify(reply)):
         question = _strip_clarify(reply)
         awaiting_clarification.add(user_id)
-        await turn_context.send_activity(f"🔎 {question}")
+        await turn_context.send_activity(Activity(
+            type="message",
+            text=question,
+            suggested_actions=SuggestedActions(
+                actions=_clarify_actions(question))
+        ))
         return
 
-    # 9️⃣ Check vague answers → ask follow-up
-    if reply and _needs_followup(user_text, reply):
+    # 9️⃣ Post-answer ambiguity check
+    if reply and _needs_followup_clarify(user_text, reply):
+        question = "To provide the most accurate document-based answer, could you clarify the model or configuration?"
         awaiting_clarification.add(user_id)
-        await turn_context.send_activity("CLARIFY: Could you specify the exact model or configuration to provide a precise, document-based answer?")
+        await turn_context.send_activity(Activity(
+            type="message",
+            text=question,
+            suggested_actions=SuggestedActions(
+                actions=_clarify_actions(question))
+        ))
         return
 
     await turn_context.send_activity(reply or "❌ No response from assistant.")
 
+# ─────────────────────────  FLASK ROUTES  ────────────────────────────────────
 
-# ──────────────── FLASK ROUTES ────────────────
+
 @app.route("/api/messages", methods=["POST"])
 def messages():
     try:
@@ -319,7 +367,15 @@ def health():
     return "Bot is running."
 
 
-# ──────────────── MAIN ────────────────
+# ─────────────────────────  MAIN  ────────────────────────────────────────────
 if __name__ == "__main__":
-    logging.info("🚀 Bot is starting...")
+    logging.info("🚀 Bot is starting on Render...")
+    logging.info("🔧 Environment check:")
+    logging.info("  MicrosoftAppId: %s", "SET" if APP_ID else "MISSING")
+    logging.info("  Azure OpenAI Endpoint: %s", AZURE_OPENAI_EP or "MISSING")
+    logging.info("  OAuth Connection: %s", OAUTH_CONNECTION or "MISSING")
+    logging.info("  Direct Line Secret: %s",
+                 "SET" if DIRECT_LINE_SECRET else "MISSING")
+    logging.info("  Admin Secret: %s", "SET" if ADMIN_SECRET else "NOT SET")
+
     app.run(host="0.0.0.0", port=3978)
