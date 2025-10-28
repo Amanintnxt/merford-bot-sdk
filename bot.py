@@ -1,18 +1,13 @@
-# ──────────────────────────────────────────────────────────────────────────────
-# bot.py – Teams / Direct Line bridge to Azure OpenAI Assistants (SSO-first)
-# Optimized version with dynamic CLARIFY logic and SSO magic code fix
-# ──────────────────────────────────────────────────────────────────────────────
 import os
+import time
 import asyncio
 import logging
-import time
 import requests
 import openai
 from dotenv import load_dotenv
-from flask import Flask, request, Response, jsonify, send_from_directory, render_template
+from flask import Flask, request, Response, jsonify, send_from_directory
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, TurnContext
-from botbuilder.schema import Activity, Attachment, CardAction, ActionTypes, OAuthCard, SuggestedActions
-from PyPDF2 import PdfReader
+from botbuilder.schema import Activity
 from openai import AzureOpenAI
 
 # ──────────────── ENV & OPENAI CONFIG ────────────────
@@ -24,7 +19,6 @@ AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_EP = os.getenv("AZURE_OPENAI_ENDPOINT")
 OAUTH_CONNECTION = os.getenv("OAUTH_CONNECTION_NAME", "TeamsSSO")
 DIRECT_LINE_SECRET = os.getenv("DIRECT_LINE_SECRET", "")
-ADMIN_SECRET = os.getenv("ADMIN_SECRET")
 
 openai.api_type = "azure"
 openai.api_version = "2024-05-01-preview"
@@ -37,7 +31,7 @@ client = AzureOpenAI(
     api_version="2024-05-01-preview"
 )
 
-# ──────────────── ASSISTANT & VECTOR STORE MAP ────────────────
+# ──────────────── ASSISTANT MAP ────────────────
 ASSISTANT_MAP = {
     "Level 1": "asst_r6q2Ve7DDwrzh0m3n3sbOote",
     "Level 2": "asst_BIOAPR48tzth4k79U4h0cPtu",
@@ -45,80 +39,27 @@ ASSISTANT_MAP = {
     "Level 4": "asst_s1OefDDIgDVpqOgfp5pfCpV1"
 }
 
-VECTOR_STORES = {
-    "Level 1": "vs_ICYlowKd3PPqtSp4m4wPzD47",
-    "Level 2": "vs_FeOttDiAigZaxb8fjp1rAOIF",
-    "Level 3": "vs_tO6kScvWu6oBn5R8YqeDkIX1",
-    "Level 4": "vs_PJIPiZ91ojScAfJmKSCHrvx2"
-}
-
 # ──────────────── FLASK & BOT ADAPTER ────────────────
-app = Flask(__name__, static_folder="static", template_folder="templates")
+app = Flask(__name__)
 adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
 adapter = BotFrameworkAdapter(adapter_settings)
 
-# ──────────────── IN-MEMORY STATE ────────────────
-thread_map = {}              # user_id:assistant_id → thread_id
-awaiting_clarification = set()  # track users awaiting clarification reply
+thread_map = {}
+awaiting_clarification = set()
 
-# ──────────────── CLARIFY LOGIC HELPERS ────────────────
-
-
-def _is_clarify(text: str) -> bool:
-    return bool(text and text.strip().upper().startswith("CLARIFY:"))
+# ──────────────── HELPERS ────────────────
 
 
-def _looks_like_clarify(text: str) -> bool:
-    """Detect if assistant message is probably a clarifying question."""
+def _is_clarify_message(text: str) -> bool:
+    """Detect if assistant is asking a clarifying question."""
     if not text:
         return False
     t = text.strip().lower()
-    if "?" not in t:
-        return False
-    starts = ("what", "which", "can you", "could you",
-              "please", "clarify", "do you")
-    return any(t.startswith(s) for s in starts) and len(t) < 200
-
-
-def _strip_clarify(text: str) -> str:
-    return text[len("CLARIFY:"):].strip() if _is_clarify(text) else text
-
-
-def _clarify_actions(question: str):
-    """Generate context-aware quick replies."""
-    lower = question.lower()
-    if "model" in lower or "type" in lower or "product" in lower:
-        opts = ["Specify model", "Not sure of model", "Any model"]
-    elif "test" in lower or "report" in lower or "certificate" in lower:
-        opts = ["EXAP report", "EN test", "Not applicable"]
-    elif "zone" in lower or "atex" in lower:
-        opts = ["Zone 1 IIB T3", "Zone 2 IIB T2", "Not sure"]
-    elif "configuration" in lower or "leaf" in lower:
-        opts = ["Single leaf", "Double leaf", "Unsure"]
-    elif "material" in lower or "panel" in lower:
-        opts = ["Steel", "Aluminium", "Composite", "Other"]
-    else:
-        opts = ["I'll specify", "Please repeat question", "Cancel"]
-    return [CardAction(type=ActionTypes.im_back, title=o, value=o) for o in opts]
-
-
-def _needs_followup_clarify(user_text: str, reply: str) -> bool:
-    """Trigger extra clarification if answer looks too generic."""
-    if not reply:
-        return False
-    ut, rp = user_text.lower(), reply.lower()
-    ambiguous = any(k in ut for k in ("what if", "can we",
-                    "options", "model", "alternative", "configuration"))
-    generic = any(k in rp for k in ("may", "depends",
-                  "options", "can be", "recommended", "varies"))
-    bullets = sum(1 for l in reply.splitlines()
-                  if l.strip().startswith(("-", "*", "1.")))
-    return ambiguous and (generic or bullets >= 3)
-
-# ──────────────── GRAPH LOOKUP ────────────────
+    return t.startswith("clarify:") or (t.endswith("?") and len(t) < 200)
 
 
 def get_user_group_level(token: str) -> str | None:
+    """Get user group (Level 1–4) via Microsoft Graph."""
     url = "https://graph.microsoft.com/v1.0/me/memberOf?$select=displayName"
     headers = {"Authorization": f"Bearer {token}"}
     try:
@@ -139,57 +80,6 @@ def get_user_group_level(token: str) -> str | None:
         return None
     return None
 
-# ──────────────── PDF UPLOAD ROUTE ────────────────
-
-
-def is_pdf_text_based(path, min_len=10):
-    try:
-        text = "".join([p.extract_text() or "" for p in PdfReader(path).pages])
-        return len(text.strip()) > min_len
-    except Exception:
-        return False
-
-
-@app.route("/upload", methods=["GET", "POST"])
-def upload_file():
-    if request.method == "POST":
-        if ADMIN_SECRET and request.form.get("secret") != ADMIN_SECRET:
-            return "Unauthorized", 403
-        level = request.form["level"]
-        file = request.files["file"]
-        if not file.filename.endswith(".pdf"):
-            return "❌ Only PDFs allowed", 400
-
-        os.makedirs("uploads", exist_ok=True)
-        path = os.path.join("uploads", file.filename)
-        file.save(path)
-
-        if not is_pdf_text_based(path):
-            os.remove(path)
-            return "❌ Invalid (image-only) PDF", 400
-
-        targets = {
-            "Level 1": ["Level 1", "Level 2", "Level 3", "Level 4"],
-            "Level 2": ["Level 2", "Level 3", "Level 4"],
-            "Level 3": ["Level 3", "Level 4"],
-            "Level 4": ["Level 4"],
-        }[level]
-
-        try:
-            with open(path, "rb") as f:
-                new_file = client.files.create(file=f, purpose="assistants")
-            for tgt in targets:
-                client.vector_stores.files.create(
-                    vector_store_id=VECTOR_STORES[tgt],
-                    file_id=new_file.id
-                )
-            return f"✅ Uploaded {file.filename} to {', '.join(targets)}"
-        finally:
-            os.remove(path)
-    return render_template("upload.html")
-
-# ──────────────── TOKEN HELPERS ────────────────
-
 
 async def try_get_token(turn_context: TurnContext, magic_code=None):
     try:
@@ -205,21 +95,11 @@ async def ensure_token(turn_context: TurnContext):
     token_resp = await try_get_token(turn_context, magic)
     if token_resp and token_resp.token:
         return token_resp.token
-
     url = await adapter.get_oauth_sign_in_link(turn_context, OAUTH_CONNECTION)
-    card = OAuthCard(
-        text="Please sign in to continue.",
-        connection_name=OAUTH_CONNECTION,
-        buttons=[CardAction(type=ActionTypes.signin,
-                            title="Sign In", value=url)],
-    )
-    await turn_context.send_activity(Activity(
-        attachments=[Attachment(
-            content_type="application/vnd.microsoft.card.oauth", content=card)]
-    ))
+    await turn_context.send_activity(f"Please sign in here to continue: {url}")
     return None
 
-# ──────────────── CORE BOT HANDLER ────────────────
+# ──────────────── MAIN MESSAGE HANDLER ────────────────
 
 
 async def handle_activity(turn_context: TurnContext):
@@ -237,91 +117,70 @@ async def handle_activity(turn_context: TurnContext):
     if a.type != "message":
         return
 
-    # 2️⃣ Detect OAuth magic code
+    # 2️⃣ Handle OAuth magic code
     if user_text.isdigit() and len(user_text) <= 10:
-        logging.info(f"🔐 OAuth magic code detected: {user_text}")
         token = await try_get_token(turn_context, user_text)
         if token and token.token:
-            await turn_context.send_activity("🔓 Sign-in successful! You can now ask your question.")
+            await turn_context.send_activity("🔓 Sign-in successful! You can now start asking questions.")
         else:
             await turn_context.send_activity("⚠️ Sign-in failed. Please click Sign In again.")
         return
 
-    # 3️⃣ Get access token
+    # 3️⃣ Ensure access token
     access_token = await ensure_token(turn_context)
     if not access_token:
         return
 
-    # 4️⃣ Resolve group → assistant
+    # 4️⃣ Get user level
     level = get_user_group_level(access_token)
     assistant_id = ASSISTANT_MAP.get(level)
     if not assistant_id:
         await turn_context.send_activity("❌ No assistant assigned for your access level.")
         return
 
+    # 5️⃣ Thread management
     key = f"{user_id}:{assistant_id}"
     thread_id = thread_map.get(key)
     if not thread_id:
         thread_id = openai.beta.threads.create().id
         thread_map[key] = thread_id
 
-    # 5️⃣ Add message to thread
+    # 6️⃣ Add message
     if user_text:
         if user_id in awaiting_clarification:
-            user_text = f"(User clarification) {user_text}"
+            user_text = f"(Clarification) {user_text}"
             awaiting_clarification.discard(user_id)
         openai.beta.threads.messages.create(
             thread_id=thread_id, role="user", content=user_text)
 
-    # 6️⃣ Run assistant
+    # 7️⃣ Run assistant
     run = openai.beta.threads.runs.create(
-        assistant_id=assistant_id,
-        thread_id=thread_id,
-        tool_choice={"type": "file_search"}
-    )
-
+        assistant_id=assistant_id, thread_id=thread_id)
     start = time.time()
     while run.status not in ("completed", "failed", "cancelled"):
         if time.time() - start > 60:
-            await turn_context.send_activity("⏳ Still processing... please try again shortly.")
+            await turn_context.send_activity("⏳ Still processing... please try again.")
             return
         await asyncio.sleep(1)
         run = openai.beta.threads.runs.retrieve(
             thread_id=thread_id, run_id=run.id)
 
-    # 7️⃣ Get reply
+    # 8️⃣ Get reply
     msgs = openai.beta.threads.messages.list(
         thread_id=thread_id, order="desc", limit=5)
     reply = next(
         (m.content[0].text.value for m in msgs.data if m.role == "assistant"), None)
 
-    # 8️⃣ Clarify handling
-    if reply and (_is_clarify(reply) or _looks_like_clarify(reply)):
-        question = _strip_clarify(reply)
+    # 9️⃣ Handle clarify messages
+    if reply and _is_clarify_message(reply):
         awaiting_clarification.add(user_id)
-        await turn_context.send_activity(Activity(
-            type="message",
-            text=question,
-            suggested_actions=SuggestedActions(
-                actions=_clarify_actions(question))
-        ))
+        await turn_context.send_activity(reply)
         return
 
-    # 9️⃣ Post-answer ambiguity check
-    if reply and _needs_followup_clarify(user_text, reply):
-        question = "To provide the most accurate document-based answer, could you clarify the model or configuration?"
-        awaiting_clarification.add(user_id)
-        await turn_context.send_activity(Activity(
-            type="message",
-            text=question,
-            suggested_actions=SuggestedActions(
-                actions=_clarify_actions(question))
-        ))
-        return
+    # 🔟 Final normal reply
+    await turn_context.send_activity(reply or "⚠️ No response received.")
 
-    await turn_context.send_activity(reply or "❌ No response from assistant.")
-
-# ─────────────────────────  FLASK ROUTES  ────────────────────────────────────
+# ──────────────── FLASK ROUTES ────────────────
 
 
 @app.route("/api/messages", methods=["POST"])
@@ -330,36 +189,15 @@ def messages():
         if "application/json" not in request.headers.get("Content-Type", ""):
             return Response("Unsupported Media Type", 415)
         activity = Activity().deserialize(request.json)
-        auth_hdr = request.headers.get("Authorization", "")
+        auth = request.headers.get("Authorization", "")
 
-        async def _proc():
-            return await adapter.process_activity(activity, auth_hdr, handle_activity)
-
-        asyncio.run(_proc())
+        async def run_task():
+            return await adapter.process_activity(activity, auth, handle_activity)
+        asyncio.run(run_task())
         return Response(status=200)
-    except Exception as ex:
-        logging.exception("Exception in /api/messages: %s", ex)
+    except Exception as e:
+        logging.error(f"Exception in /api/messages: {e}")
         return Response("Internal Server Error", 500)
-
-
-@app.route("/directline/token", methods=["POST"])
-def directline_token():
-    if not DIRECT_LINE_SECRET:
-        return jsonify({"error": "DIRECT_LINE_SECRET not set"}), 500
-    r = requests.post(
-        "https://directline.botframework.com/v3/directline/tokens/generate",
-        headers={"Authorization": f"Bearer {DIRECT_LINE_SECRET}"},
-        timeout=10
-    )
-    if r.status_code != 200:
-        logging.error("Direct Line token generation failed: %s", r.text)
-        return jsonify({"error": "Failed to generate token"}), 500
-    return jsonify({"token": r.json().get("token")})
-
-
-@app.route("/chat", methods=["GET"])
-def chat():
-    return send_from_directory(app.static_folder, "index.html")
 
 
 @app.route("/", methods=["GET"])
@@ -367,15 +205,6 @@ def health():
     return "Bot is running."
 
 
-# ─────────────────────────  MAIN  ────────────────────────────────────────────
 if __name__ == "__main__":
-    logging.info("🚀 Bot is starting on Render...")
-    logging.info("🔧 Environment check:")
-    logging.info("  MicrosoftAppId: %s", "SET" if APP_ID else "MISSING")
-    logging.info("  Azure OpenAI Endpoint: %s", AZURE_OPENAI_EP or "MISSING")
-    logging.info("  OAuth Connection: %s", OAUTH_CONNECTION or "MISSING")
-    logging.info("  Direct Line Secret: %s",
-                 "SET" if DIRECT_LINE_SECRET else "MISSING")
-    logging.info("  Admin Secret: %s", "SET" if ADMIN_SECRET else "NOT SET")
-
+    logging.basicConfig(level=logging.INFO)
     app.run(host="0.0.0.0", port=3978)
