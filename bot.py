@@ -1,10 +1,13 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # bot.py – Teams / Direct Line bridge to Azure OpenAI Assistants (SSO-first)
+# Dynamic CLARIFY flow (JSON-first) + SSO (magic code) + file_search enforced
 # ──────────────────────────────────────────────────────────────────────────────
 import os
+import re
+import json
+import time
 import asyncio
 import logging
-import time
 import requests
 import openai
 from dotenv import load_dotenv
@@ -14,7 +17,7 @@ from botbuilder.schema import Activity, Attachment, CardAction, ActionTypes, OAu
 from PyPDF2 import PdfReader
 from openai import AzureOpenAI
 
-# ─────────────────────────  ENV & OPENAI CONFIG  ────────────────────────────
+# ──────────────── ENV & OPENAI CONFIG ────────────────
 load_dotenv()
 
 APP_ID = os.getenv("MicrosoftAppId", "")
@@ -23,7 +26,7 @@ AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_EP = os.getenv("AZURE_OPENAI_ENDPOINT")
 OAUTH_CONNECTION = os.getenv("OAUTH_CONNECTION_NAME", "TeamsSSO")
 DIRECT_LINE_SECRET = os.getenv("DIRECT_LINE_SECRET", "")
-ADMIN_SECRET = os.getenv("ADMIN_SECRET")  # 🔐 Optional secret for /upload
+ADMIN_SECRET = os.getenv("ADMIN_SECRET")
 
 openai.api_type = "azure"
 openai.api_version = "2024-05-01-preview"
@@ -36,11 +39,7 @@ client = AzureOpenAI(
     api_version="2024-05-01-preview"
 )
 
-# ─────────────────────────  LOGGING  ─────────────────────────────────────────
-# logging.basicConfig(level=logging.INFO,
-#                     format="%(asctime)s  %(levelname)-7s %(message)s")
-
-# ─────────────────────────  ASSISTANT IDS (exact!)  ──────────────────────────
+# ──────────────── ASSISTANT & VECTOR STORE MAP ────────────────
 ASSISTANT_MAP = {
     "Level 1": "asst_r6q2Ve7DDwrzh0m3n3sbOote",
     "Level 2": "asst_BIOAPR48tzth4k79U4h0cPtu",
@@ -48,7 +47,6 @@ ASSISTANT_MAP = {
     "Level 4": "asst_s1OefDDIgDVpqOgfp5pfCpV1"
 }
 
-# Vector store IDs
 VECTOR_STORES = {
     "Level 1": "vs_ICYlowKd3PPqtSp4m4wPzD47",
     "Level 2": "vs_FeOttDiAigZaxb8fjp1rAOIF",
@@ -56,18 +54,16 @@ VECTOR_STORES = {
     "Level 4": "vs_PJIPiZ91ojScAfJmKSCHrvx2"
 }
 
-# ─────────────────────────  FLASK & BOT ADAPTER  ─────────────────────────────
+# ──────────────── FLASK & BOT ADAPTER ────────────────
 app = Flask(__name__, static_folder="static", template_folder="templates")
-app.logger.handlers = logging.getLogger().handlers
-app.logger.setLevel(logging.INFO)
 adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
 adapter = BotFrameworkAdapter(adapter_settings)
 
-# ─────────────────────────  IN-MEMORY STATE  ────────────────────────────────
-thread_map = {}        # key = f"{user_id}:{assistant_id}" → thread_id
-awaiting_clarification = set()  # user_ids awaiting a reply to a clarify question
+# ──────────────── IN-MEMORY STATE ────────────────
+thread_map = {}              # user_id:assistant_id → thread_id
+awaiting_clarification = set()  # track users awaiting clarification reply
 
-# ─────────────────────────  CLARIFY HELPERS  ────────────────────────────────
+# ──────────────── CLARIFY LOGIC HELPERS ────────────────
 
 
 def _is_clarify(text: str) -> bool:
@@ -75,71 +71,95 @@ def _is_clarify(text: str) -> bool:
 
 
 def _looks_like_clarify(text: str) -> bool:
-    """Heuristic: treat short interrogative assistant replies as clarification prompts
-    even if they don't include the CLARIFY: prefix (e.g., 'What specific alternative ...?')."""
+    """Detect if assistant message is probably a clarifying question (no prefix)."""
     if not text:
         return False
-    t = text.strip()
+    t = text.strip().lower()
     if "?" not in t:
         return False
-    lower = t.lower()
-    starts = (
-        "what ", "which ", "can you", "could you", "do you",
-        "please specify", "please provide", "provide ", "clarify "
-    )
-    return any(lower.startswith(s) for s in starts) or len(t) <= 220
+    starts = ("what", "which", "can you", "could you",
+              "please", "clarify", "do you")
+    return any(t.startswith(s) for s in starts) and len(t) < 200
 
 
 def _strip_clarify(text: str) -> str:
-    return text[len("CLARIFY:"):].strip() if _is_clarify(text) else (text or "")
+    return text[len("CLARIFY:"):].strip() if _is_clarify(text) else text
 
 
-def _clarify_actions(question_text: str):
-    """Build quick replies based on the clarify question."""
-    lower = (question_text or "").lower()
-    if "model" in lower or "product" in lower:
-        opts = ["Model: M-series", "Model: Unknown", "Provide model later"]
-    elif "ticket" in lower or "report" in lower or "certificate" in lower:
-        opts = ["Report: EXAP …", "Ticket: 1234", "No report"]
-    elif "configuration" in lower or "single" in lower or "double" in lower:
-        opts = ["Single leaf", "Double leaf", "Not sure"]
-    elif "zone" in lower or "atex" in lower:
-        opts = ["Zone 2 IIB T2", "Other zone", "Not sure"]
+JSON_BLOCK_RE = re.compile(
+    r"```json\s*(\{[\s\S]*?\})\s*```|^(\{[\s\S]*\})$", re.MULTILINE)
+
+
+def _extract_clarify_from_reply(reply: str):
+    """
+    Extract {"clarify":{"question":..., "options":[...]}} from assistant reply.
+    Supports plain JSON or fenced ```json blocks. Returns (question, options) or (None, None).
+    """
+    if not reply:
+        return None, None
+    m = JSON_BLOCK_RE.search(reply.strip())
+    raw = (m.group(1) or m.group(2)) if m else None
+    if not raw:
+        return None, None
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return None, None
+    if not isinstance(obj, dict) or "clarify" not in obj or not isinstance(obj["clarify"], dict):
+        return None, None
+    q = (obj["clarify"].get("question") or "").strip()
+    opts = obj["clarify"].get("options") or []
+    if not q:
+        return None, None
+    if not isinstance(opts, list):
+        opts = []
+    # de-dup and cap to 5
+    seen, uniq = set(), []
+    for o in (str(x).strip() for x in opts if str(x).strip()):
+        if o not in seen:
+            uniq.append(o)
+            seen.add(o)
+        if len(uniq) >= 5:
+            break
+    return q, uniq
+
+
+def _clarify_actions(question: str, options: list[str] | None = None):
+    """Render quick replies from options; fallback to minimal heuristics if none."""
+    if options:
+        opts = options[:4]
     else:
-        opts = ["I will specify", "Please show options", "Cancel"]
+        lower = (question or "").lower()
+        if "model" in lower or "product" in lower:
+            opts = ["Specify model", "Not sure of model", "Any model"]
+        elif "report" in lower or "certificate" in lower:
+            opts = ["EXAP report", "EN test", "Not applicable"]
+        elif "configuration" in lower:
+            opts = ["Single leaf", "Double leaf", "Not sure"]
+        elif "zone" in lower or "atex" in lower:
+            opts = ["Zone 1 IIB T3", "Zone 2 IIB T2", "Not sure"]
+        else:
+            opts = ["I'll specify", "Please repeat question", "Cancel"]
     return [CardAction(type=ActionTypes.im_back, title=o, value=o) for o in opts]
 
 
 def _needs_followup_clarify(user_text: str, reply: str) -> bool:
-    """
-    Ask for clarification if the user query is likely ambiguous AND
-    the assistant reply looks multi-option/generic (after file_search completed).
-    """
+    """Trigger extra clarification if the question is ambiguous and the answer looks generic/option-heavy."""
     if not reply:
         return False
-
-    ut = (user_text or "").lower()
-    rp = reply.lower()
-
-    # Ambiguous query markers (from client feedback patterns)
-    query_ambiguous = any(k in ut for k in (
+    ut, rp = (user_text or "").lower(), reply.lower()
+    ambiguous = any(k in ut for k in (
         "what if", "is it possible", "can we", "alternative", "options",
         "non-standard", "zone", "atex", "configuration", "model",
-        "rc2", "rc3", "strike plate", "el560", "top jamb", "fluid pressure",
-        "door closer"
+        "rc2", "rc3", "strike plate", "el560", "top jamb", "fluid pressure", "door closer"
     ))
+    generic = any(k in rp for k in ("may", "depends", "options",
+                  "can be", "recommended", "varies", "consider"))
+    bullets = sum(1 for l in reply.splitlines()
+                  if l.strip().startswith(("-", "*", "1.", "2.", "3.")))
+    return ambiguous and (generic or bullets >= 3)
 
-    # Generic/option-heavy answer markers
-    bullets = sum(1 for line in reply.splitlines()
-                  if line.strip().startswith((" -", "-", "*", "1.", "2.", "3.")))
-    generic_markers = any(p in rp for p in (
-        "options", "alternative", "may", "can be", "depends", "recommended",
-        "consider", "it is advisable", "varies", "multiple"
-    ))
-
-    return query_ambiguous and (bullets >= 3 or generic_markers)
-
-# ─────────────────────────  GRAPH LOOK-UP  ───────────────────────────────────
+# ──────────────── GRAPH LOOKUP ────────────────
 
 
 def get_user_group_level(token: str) -> str | None:
@@ -147,40 +167,29 @@ def get_user_group_level(token: str) -> str | None:
     headers = {"Authorization": f"Bearer {token}"}
     try:
         resp = requests.get(url, headers=headers, timeout=10)
-    except requests.RequestException as e:
-        logging.warning("Graph request error: %s", e)
+        if resp.status_code != 200:
+            return None
+        for g in resp.json().get("value", []):
+            name = g.get("displayName", "")
+            if "Level1Access" in name:
+                return "Level 1"
+            if "Level2Access" in name:
+                return "Level 2"
+            if "Level3Access" in name:
+                return "Level 3"
+            if "Level4Access" in name:
+                return "Level 4"
+    except Exception:
         return None
-
-    if resp.status_code != 200:
-        logging.warning("Graph /me/memberOf failed %s – %s",
-                        resp.status_code, resp.text)
-        return None
-
-    for g in resp.json().get("value", []):
-        name = g.get("displayName")
-        if not name:
-            continue
-        logging.info("AAD group found: %s", name)
-        if name == "Level1Access":
-            return "Level 1"
-        if name == "Level2Access":
-            return "Level 2"
-        if name == "Level3Access":
-            return "Level 3"
-        if name == "Level4Access":
-            return "Level 4"
     return None
 
-# ─────────────────────────  PDF UPLOAD HELPERS  ─────────────────────────────
+# ──────────────── PDF UPLOAD ROUTE ────────────────
 
 
-def is_pdf_text_based(file_path, min_text_length=10):
-    """Check if a PDF contains searchable text."""
+def is_pdf_text_based(path, min_len=10):
     try:
-        reader = PdfReader(file_path)
-        text_content = "".join(
-            [page.extract_text() or "" for page in reader.pages])
-        return len(text_content.strip()) >= min_text_length
+        text = "".join([p.extract_text() or "" for p in PdfReader(path).pages])
+        return len(text.strip()) > min_len
     except Exception:
         return False
 
@@ -190,58 +199,46 @@ def upload_file():
     if request.method == "POST":
         if ADMIN_SECRET and request.form.get("secret") != ADMIN_SECRET:
             return "Unauthorized", 403
-
         level = request.form["level"]
         file = request.files["file"]
-
         if not file.filename.endswith(".pdf"):
-            return "❌ Only PDF files allowed", 400
+            return "❌ Only PDFs allowed", 400
 
-        save_path = os.path.join("uploads", file.filename)
         os.makedirs("uploads", exist_ok=True)
-        file.save(save_path)
+        path = os.path.join("uploads", file.filename)
+        file.save(path)
 
-        if not is_pdf_text_based(save_path):
-            os.remove(save_path)
-            return "❌ Invalid PDF (image-only, no text).", 400
+        if not is_pdf_text_based(path):
+            os.remove(path)
+            return "❌ Invalid (image-only) PDF", 400
 
-        if level == "Level 1":
-            targets = ["Level 1", "Level 2", "Level 3", "Level 4"]
-        elif level == "Level 2":
-            targets = ["Level 2", "Level 3", "Level 4"]
-        elif level == "Level 3":
-            targets = ["Level 3", "Level 4"]
-        else:
-            targets = ["Level 4"]
+        targets = {
+            "Level 1": ["Level 1", "Level 2", "Level 3", "Level 4"],
+            "Level 2": ["Level 2", "Level 3", "Level 4"],
+            "Level 3": ["Level 3", "Level 4"],
+            "Level 4": ["Level 4"],
+        }[level]
 
         try:
-            with open(save_path, "rb") as f:
+            with open(path, "rb") as f:
                 new_file = client.files.create(file=f, purpose="assistants")
             for tgt in targets:
                 client.vector_stores.files.create(
                     vector_store_id=VECTOR_STORES[tgt],
                     file_id=new_file.id
                 )
-            logging.info("Uploaded %s to %s", file.filename, targets)
             return f"✅ Uploaded {file.filename} to {', '.join(targets)}"
-        except Exception as e:
-            logging.exception("Upload failed")
-            return f"⚠️ Upload failed: {e}", 500
         finally:
-            if os.path.exists(save_path):
-                os.remove(save_path)
-
+            os.remove(path)
     return render_template("upload.html")
 
-# ─────────────────────────  TOKEN HELPERS  ───────────────────────────────────
+# ──────────────── TOKEN HELPERS ────────────────
 
 
-async def try_get_token(turn_context: TurnContext, magic_code: str | None = None):
+async def try_get_token(turn_context: TurnContext, magic_code=None):
     try:
         return await adapter.get_user_token(turn_context, OAUTH_CONNECTION, magic_code)
-    except Exception as e:
-        logging.info(
-            "get_user_token exception (will fall back to prompt): %s", e)
+    except Exception:
         return None
 
 
@@ -249,9 +246,6 @@ async def ensure_token(turn_context: TurnContext):
     magic = None
     if turn_context.activity.value and isinstance(turn_context.activity.value, dict):
         magic = turn_context.activity.value.get("state")
-    if not magic and turn_context.activity.text and turn_context.activity.text.strip().isdigit():
-        magic = turn_context.activity.text.strip()
-
     token_resp = await try_get_token(turn_context, magic)
     if token_resp and token_resp.token:
         return token_resp.token
@@ -267,111 +261,124 @@ async def ensure_token(turn_context: TurnContext):
         attachments=[Attachment(
             content_type="application/vnd.microsoft.card.oauth", content=card)]
     ))
-    logging.info("Sent sign-in card to %s",
-                 turn_context.activity.from_property.id)
     return None
 
-# ─────────────────────────  CORE BOT HANDLER  ────────────────────────────────
+# ──────────────── CORE BOT HANDLER ────────────────
 
 
 async def handle_activity(turn_context: TurnContext):
     a = turn_context.activity
-    user_id = (a.from_property.id or "unknown")
+    user_id = a.from_property.id
+    user_text = (a.text or "").strip()
 
-    # 1) Teams conversation start
+    # 1) On join
     if a.type == "conversationUpdate":
         for m in a.members_added or []:
             if m.id == a.recipient.id:
-                await turn_context.send_activity(
-                    "✅ Connected. If you're in Teams, SSO is automatic. In Web Chat, click **Sign In** once."
-                )
+                await turn_context.send_activity("✅ Connected. Please sign in to continue.")
         return
 
-    # 2) Teams SSO invokes
-    if a.type == "invoke" and a.name in ("signin/verifyState", "tokenExchange"):
-        logging.info("Received invoke: %s", a.name)
-        token = await try_get_token(turn_context)
-        if token:
-            await turn_context.send_activity("🔐 You're signed in. Ask your question")
-        return
-
-    # 3) Regular messages only
     if a.type != "message":
         return
 
-    user_text = (a.text or "").strip()
-    if not user_text and not (a.value and a.value.get("state")):
+    # 2) Magic code (Direct Line/Web Chat)
+    if user_text.isdigit() and len(user_text) <= 10:
+        token = await try_get_token(turn_context, user_text)
+        if token and token.token:
+            await turn_context.send_activity("🔓 Sign-in successful! You can now ask your question.")
+        else:
+            await turn_context.send_activity("⚠️ Sign-in failed. Please click Sign In again.")
         return
 
-    # 4) Acquire token
+    # 3) Access token
     access_token = await ensure_token(turn_context)
     if not access_token:
-        return  # waiting for sign-in
-
-    # 5) Resolve level → assistant
-    level = get_user_group_level(access_token)
-    logging.info("User %s level = %s", user_id, level)
-    assistant_id = ASSISTANT_MAP.get(level)
-    if not assistant_id:
-        await turn_context.send_activity("❌ No assistant mapped to your access. Please contact admin.")
         return
 
-    # 6) Thread isolation
+    # 4) Resolve group → assistant
+    level = get_user_group_level(access_token)
+    assistant_id = ASSISTANT_MAP.get(level)
+    if not assistant_id:
+        await turn_context.send_activity("❌ No assistant assigned for your access level.")
+        return
+
     key = f"{user_id}:{assistant_id}"
     thread_id = thread_map.get(key)
     if not thread_id:
         thread_id = openai.beta.threads.create().id
         thread_map[key] = thread_id
-        logging.info("Created thread %s for %s", thread_id, key)
 
-    # 7) Add user message
-    if user_text and not user_text.isdigit():
-        content_to_send = user_text
+    # 5) Add message to thread
+    if user_text:
         if user_id in awaiting_clarification:
-            logging.info("↩️ Clarification received from %s: %s",
-                         user_id, user_text)
-            content_to_send = f"(User clarification) {user_text}"
+            user_text = f"(User clarification) {user_text}"
             awaiting_clarification.discard(user_id)
-
         openai.beta.threads.messages.create(
-            thread_id=thread_id, role="user", content=content_to_send
-        )
+            thread_id=thread_id, role="user", content=user_text)
 
-    # 8) Run assistant
-    try:
-        run = openai.beta.threads.runs.create(
-            assistant_id=assistant_id,
-            thread_id=thread_id,
-            tool_choice={"type": "file_search"}
-        )
-    except Exception as e:
-        logging.exception("Assistant run create failed")
-        await turn_context.send_activity(f"❌ Assistant run failed: {e}")
-        return
+    # 6) Run assistant (file_search enforced)
+    run = openai.beta.threads.runs.create(
+        assistant_id=assistant_id,
+        thread_id=thread_id,
+        tool_choice={"type": "file_search"}
+    )
 
     start = time.time()
     while run.status not in ("completed", "failed", "cancelled"):
         if time.time() - start > 60:
-            await turn_context.send_activity("⏳ Still working… please send again if no reply arrives.")
-            break
+            await turn_context.send_activity("⏳ Still processing... please try again shortly.")
+            return
         await asyncio.sleep(1)
         run = openai.beta.threads.runs.retrieve(
             thread_id=thread_id, run_id=run.id)
 
-    # 9) Fetch newest assistant message
-    try:
-        msgs = openai.beta.threads.messages.list(
-            thread_id=thread_id, order="desc", limit=5)
-        reply = next(
-            (m.content[0].text.value for m in msgs.data if m.role == "assistant"), None)
-    except Exception:
-        logging.exception("Fetch messages failed")
-        reply = None
+    # 7) Get reply
+    msgs = openai.beta.threads.messages.list(
+        thread_id=thread_id, order="desc", limit=5)
+    reply = next(
+        (m.content[0].text.value for m in msgs.data if m.role == "assistant"), None)
 
-    # 9.1) Clarify-first handling (prefix or heuristic question detection)
+    # 8) Clarify handling (JSON preferred)
+    q_json, opts_json = _extract_clarify_from_reply(reply or "")
+    if q_json:
+        awaiting_clarification.add(user_id)
+        actions = _clarify_actions(q_json, opts_json) if opts_json else None
+        await turn_context.send_activity(Activity(
+            type="message",
+            text=q_json,
+            suggested_actions=SuggestedActions(
+                actions=actions) if actions else None
+        ))
+        return
+
+    # Fallback to prefix/heuristic clarify
     if reply and (_is_clarify(reply) or _looks_like_clarify(reply)):
-        question = _strip_clarify(reply) if _is_clarify(reply) else reply
-        logging.info("🟡 CLARIFY triggered for %s: %s", user_id, question)
+        question = _strip_clarify(reply)
+        awaiting_clarification.add(user_id)
+        await turn_context.send_activity(Activity(
+            type="message",
+            text=question
+        ))
+        return
+
+    # 9) Post-answer ambiguity check (research done → still ambiguous? ask CLARIFY)
+    if reply and _needs_followup_clarify(a.text or "", reply):
+        # Try JSON again if assistant embedded clarify object
+        q_json2, opts_json2 = _extract_clarify_from_reply(reply)
+        if q_json2:
+            awaiting_clarification.add(user_id)
+            actions = _clarify_actions(
+                q_json2, opts_json2) if opts_json2 else None
+            await turn_context.send_activity(Activity(
+                type="message",
+                text=q_json2,
+                suggested_actions=SuggestedActions(
+                    actions=actions) if actions else None
+            ))
+            return
+        # Otherwise heuristic question with minimal options
+        question = ("To provide the most accurate document-based answer, "
+                    "could you clarify the model/configuration or the relevant test/cert reference?")
         awaiting_clarification.add(user_id)
         await turn_context.send_activity(Activity(
             type="message",
@@ -381,22 +388,8 @@ async def handle_activity(turn_context: TurnContext):
         ))
         return
 
-    # 9.2) Post-answer ambiguity check (research done → still ambiguous? ask CLARIFY)
-    if reply and _needs_followup_clarify(user_text, reply):
-        question = ("To answer precisely from the documents, could you clarify the exact "
-                    "model/configuration or the relevant test/certification reference?")
-        logging.info(
-            "🟡 POST-CLARIFY triggered for %s (heuristic): %s", user_id, question)
-        awaiting_clarification.add(user_id)
-        await turn_context.send_activity(Activity(
-            type="message",
-            text=question,
-            suggested_actions=SuggestedActions(
-                actions=_clarify_actions(question))
-        ))
-        return
-
-    await turn_context.send_activity(reply or "❌ No reply from assistant.")
+    # 10) Send final
+    await turn_context.send_activity(reply or "❌ No response from assistant.")
 
 # ─────────────────────────  FLASK ROUTES  ────────────────────────────────────
 
@@ -446,13 +439,11 @@ def health():
 
 # ─────────────────────────  MAIN  ────────────────────────────────────────────
 if __name__ == "__main__":
-    logging.info("🚀 Bot is starting on Render...")
-    logging.info("🔧 Environment check:")
+    logging.info("🚀 Bot is starting...")
     logging.info("  MicrosoftAppId: %s", "SET" if APP_ID else "MISSING")
     logging.info("  Azure OpenAI Endpoint: %s", AZURE_OPENAI_EP or "MISSING")
     logging.info("  OAuth Connection: %s", OAUTH_CONNECTION or "MISSING")
     logging.info("  Direct Line Secret: %s",
                  "SET" if DIRECT_LINE_SECRET else "MISSING")
     logging.info("  Admin Secret: %s", "SET" if ADMIN_SECRET else "NOT SET")
-
     app.run(host="0.0.0.0", port=3978)
