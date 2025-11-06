@@ -1,6 +1,8 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# Minimal bot.py — SSO + magic code + simple CLARIFY handling (text-only)
-# with chat routes (/chat) and Direct Line token route (/directline/token)
+# bot.py — Minimal, step-wise CLARIFY flow + SSO + magic code + chat routes
+# - New thread per top-level question
+# - Same thread during CLARIFY loop
+# - Text-only clarifications using "CLARIFY: " prefix from assistant
 # ──────────────────────────────────────────────────────────────────────────────
 import os
 import re
@@ -22,8 +24,7 @@ APP_PASSWORD = os.getenv("MicrosoftAppPassword", "")
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_EP = os.getenv("AZURE_OPENAI_ENDPOINT")
 OAUTH_CONNECTION = os.getenv("OAUTH_CONNECTION_NAME", "TeamsSSO")
-DIRECT_LINE_SECRET = os.getenv(
-    "DIRECT_LINE_SECRET", "")  # for /directline/token
+DIRECT_LINE_SECRET = os.getenv("DIRECT_LINE_SECRET", "")
 
 openai.api_type = "azure"
 openai.api_version = "2024-05-01-preview"
@@ -44,8 +45,8 @@ adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
 adapter = BotFrameworkAdapter(adapter_settings)
 
 # ─────────────── Simple state ───────────────
-thread_map = {}              # user_id:assistant_id → thread_id
-awaiting_clarification = set()  # users expecting to answer a CLARIFY
+thread_map = {}                 # key: f"{user_id}:{assistant_id}" → thread_id
+awaiting_clarification = set()  # users currently answering a CLARIFY
 
 # ─────────────── Helpers ───────────────
 
@@ -80,6 +81,7 @@ async def try_get_token(turn_context: TurnContext, magic_code: str | None = None
 
 
 async def ensure_token(turn_context: TurnContext) -> str | None:
+    """Silent SSO → magic code in value.state → OAuth card."""
     magic = None
     if turn_context.activity.value and isinstance(turn_context.activity.value, dict):
         magic = turn_context.activity.value.get("state")
@@ -120,6 +122,7 @@ async def handle_activity(turn_context: TurnContext):
     a = turn_context.activity
     user_id = a.from_property.id
 
+    # Conversation start
     if a.type == "conversationUpdate":
         for m in a.members_added or []:
             if m.id == a.recipient.id:
@@ -131,6 +134,7 @@ async def handle_activity(turn_context: TurnContext):
 
     user_text = (a.text or "").strip()
 
+    # Magic code
     if is_magic_code(user_text):
         token_resp = await try_get_token(turn_context, user_text)
         if token_resp and token_resp.token:
@@ -139,10 +143,12 @@ async def handle_activity(turn_context: TurnContext):
             await turn_context.send_activity("⚠️ Sign-in failed. Please click Sign In again.")
         return
 
+    # Ensure token
     access_token = await ensure_token(turn_context)
     if not access_token:
         return
 
+    # Resolve level → assistant
     level = get_user_group_level(access_token)
     assistant_id = ASSISTANT_MAP.get(level)
     if not assistant_id:
@@ -150,11 +156,20 @@ async def handle_activity(turn_context: TurnContext):
         return
 
     key = f"{user_id}:{assistant_id}"
-    thread_id = thread_map.get(key)
-    if not thread_id:
+
+    # 1) NEW: New thread per top-level question; same thread while clarifying
+    prev_thread = thread_map.get(key)
+    if user_id in awaiting_clarification:
+        thread_id = prev_thread or openai.beta.threads.create().id
+        thread_map[key] = thread_id
+    else:
         thread_id = openai.beta.threads.create().id
         thread_map[key] = thread_id
+        # reset clarify state on fresh case
+        awaiting_clarification.discard(user_id)
+        logging.info("Started NEW thread %s for %s", thread_id, key)
 
+    # 2) Add message (tag if clarification)
     if user_text:
         content = user_text
         if user_id in awaiting_clarification:
@@ -163,6 +178,7 @@ async def handle_activity(turn_context: TurnContext):
         openai.beta.threads.messages.create(
             thread_id=thread_id, role="user", content=content)
 
+    # 3) Run assistant (file_search; assistant set to temperature=0)
     run = openai.beta.threads.runs.create(
         assistant_id=assistant_id,
         thread_id=thread_id,
@@ -178,17 +194,22 @@ async def handle_activity(turn_context: TurnContext):
         run = openai.beta.threads.runs.retrieve(
             thread_id=thread_id, run_id=run.id)
 
+    # 4) Get assistant reply
     msgs = openai.beta.threads.messages.list(
         thread_id=thread_id, order="desc", limit=5)
     reply = next(
         (m.content[0].text.value for m in msgs.data if m.role == "assistant"), None)
 
+    # 5) Clarify loop
     if reply and is_clarify(reply):
         question = strip_clarify(reply)
         awaiting_clarification.add(user_id)
         await turn_context.send_activity(Activity(type="message", text=question))
         return
 
+    # 6) Final answer → reset so next user message is a fresh case
+    awaiting_clarification.discard(user_id)
+    thread_map.pop(key, None)
     await turn_context.send_activity(reply or "❌ No response from assistant.")
 
 # ─────────────── Bot connector route ───────────────
@@ -230,7 +251,6 @@ def directline_token():
 
 @app.route("/chat", methods=["GET"])
 def chat():
-    # Serve static/index.html (put your Web Chat page there)
     return send_from_directory(app.static_folder, "index.html")
 
 
