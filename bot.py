@@ -1,11 +1,10 @@
-# ──────────────────────────────────────────────────────────────────────────────
-# bot.py – Teams / Direct Line bridge to Azure OpenAI Assistants (SSO-first)
-# Optimized version with dynamic CLARIFY logic and SSO magic code fix
-# ──────────────────────────────────────────────────────────────────────────────
+
 import os
+import re
+import json
+import time
 import asyncio
 import logging
-import time
 import requests
 import openai
 from dotenv import load_dotenv
@@ -69,7 +68,7 @@ def _is_clarify(text: str) -> bool:
 
 
 def _looks_like_clarify(text: str) -> bool:
-    """Detect if assistant message is probably a clarifying question."""
+    """Detect if assistant message is probably a clarifying question (no prefix)."""
     if not text:
         return False
     t = text.strip().lower()
@@ -84,35 +83,77 @@ def _strip_clarify(text: str) -> str:
     return text[len("CLARIFY:"):].strip() if _is_clarify(text) else text
 
 
-def _clarify_actions(question: str):
-    """Generate context-aware quick replies."""
-    lower = question.lower()
-    if "model" in lower or "type" in lower or "product" in lower:
-        opts = ["Specify model", "Not sure of model", "Any model"]
-    elif "test" in lower or "report" in lower or "certificate" in lower:
-        opts = ["EXAP report", "EN test", "Not applicable"]
-    elif "zone" in lower or "atex" in lower:
-        opts = ["Zone 1 IIB T3", "Zone 2 IIB T2", "Not sure"]
-    elif "configuration" in lower or "leaf" in lower:
-        opts = ["Single leaf", "Double leaf", "Unsure"]
-    elif "material" in lower or "panel" in lower:
-        opts = ["Steel", "Aluminium", "Composite", "Other"]
+JSON_BLOCK_RE = re.compile(
+    r"```json\s*(\{[\s\S]*?\})\s*```|^(\{[\s\S]*\})$", re.MULTILINE)
+
+
+def _extract_clarify_from_reply(reply: str):
+    """
+    Extract {"clarify":{"question":..., "options":[...]}} from assistant reply.
+    Supports plain JSON or fenced ```json blocks. Returns (question, options) or (None, None).
+    """
+    if not reply:
+        return None, None
+    m = JSON_BLOCK_RE.search(reply.strip())
+    raw = (m.group(1) or m.group(2)) if m else None
+    if not raw:
+        return None, None
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return None, None
+    if not isinstance(obj, dict) or "clarify" not in obj or not isinstance(obj["clarify"], dict):
+        return None, None
+    q = (obj["clarify"].get("question") or "").strip()
+    opts = obj["clarify"].get("options") or []
+    if not q:
+        return None, None
+    if not isinstance(opts, list):
+        opts = []
+    # de-dup and cap to 5
+    seen, uniq = set(), []
+    for o in (str(x).strip() for x in opts if str(x).strip()):
+        if o not in seen:
+            uniq.append(o)
+            seen.add(o)
+        if len(uniq) >= 5:
+            break
+    return q, uniq
+
+
+def _clarify_actions(question: str, options: list[str] | None = None):
+    """Render quick replies from options; fallback to minimal heuristics if none."""
+    if options:
+        opts = options[:4]
     else:
-        opts = ["I'll specify", "Please repeat question", "Cancel"]
+        lower = (question or "").lower()
+        if "model" in lower or "product" in lower:
+            opts = ["Specify model", "Not sure of model", "Any model"]
+        elif "report" in lower or "certificate" in lower:
+            opts = ["EXAP report", "EN test", "Not applicable"]
+        elif "configuration" in lower:
+            opts = ["Single leaf", "Double leaf", "Not sure"]
+        elif "zone" in lower or "atex" in lower:
+            opts = ["Zone 1 IIB T3", "Zone 2 IIB T2", "Not sure"]
+        else:
+            opts = ["I'll specify", "Please repeat question", "Cancel"]
     return [CardAction(type=ActionTypes.im_back, title=o, value=o) for o in opts]
 
 
 def _needs_followup_clarify(user_text: str, reply: str) -> bool:
-    """Trigger extra clarification if answer looks too generic."""
+    """Trigger extra clarification if the question is ambiguous and the answer looks generic/option-heavy."""
     if not reply:
         return False
-    ut, rp = user_text.lower(), reply.lower()
-    ambiguous = any(k in ut for k in ("what if", "can we",
-                    "options", "model", "alternative", "configuration"))
-    generic = any(k in rp for k in ("may", "depends",
-                  "options", "can be", "recommended", "varies"))
+    ut, rp = (user_text or "").lower(), reply.lower()
+    ambiguous = any(k in ut for k in (
+        "what if", "is it possible", "can we", "alternative", "options",
+        "non-standard", "zone", "atex", "configuration", "model",
+        "rc2", "rc3", "strike plate", "el560", "top jamb", "fluid pressure", "door closer"
+    ))
+    generic = any(k in rp for k in ("may", "depends", "options",
+                  "can be", "recommended", "varies", "consider"))
     bullets = sum(1 for l in reply.splitlines()
-                  if l.strip().startswith(("-", "*", "1.")))
+                  if l.strip().startswith(("-", "*", "1.", "2.", "3.")))
     return ambiguous and (generic or bullets >= 3)
 
 # ──────────────── GRAPH LOOKUP ────────────────
@@ -227,7 +268,7 @@ async def handle_activity(turn_context: TurnContext):
     user_id = a.from_property.id
     user_text = (a.text or "").strip()
 
-    # 1️⃣ On join
+    # 1) On join
     if a.type == "conversationUpdate":
         for m in a.members_added or []:
             if m.id == a.recipient.id:
@@ -237,9 +278,8 @@ async def handle_activity(turn_context: TurnContext):
     if a.type != "message":
         return
 
-    # 2️⃣ Detect OAuth magic code
+    # 2) Magic code (Direct Line/Web Chat)
     if user_text.isdigit() and len(user_text) <= 10:
-        logging.info(f"🔐 OAuth magic code detected: {user_text}")
         token = await try_get_token(turn_context, user_text)
         if token and token.token:
             await turn_context.send_activity("🔓 Sign-in successful! You can now ask your question.")
@@ -247,12 +287,12 @@ async def handle_activity(turn_context: TurnContext):
             await turn_context.send_activity("⚠️ Sign-in failed. Please click Sign In again.")
         return
 
-    # 3️⃣ Get access token
+    # 3) Access token
     access_token = await ensure_token(turn_context)
     if not access_token:
         return
 
-    # 4️⃣ Resolve group → assistant
+    # 4) Resolve group → assistant
     level = get_user_group_level(access_token)
     assistant_id = ASSISTANT_MAP.get(level)
     if not assistant_id:
@@ -265,7 +305,7 @@ async def handle_activity(turn_context: TurnContext):
         thread_id = openai.beta.threads.create().id
         thread_map[key] = thread_id
 
-    # 5️⃣ Add message to thread
+    # 5) Add message to thread
     if user_text:
         if user_id in awaiting_clarification:
             user_text = f"(User clarification) {user_text}"
@@ -273,7 +313,7 @@ async def handle_activity(turn_context: TurnContext):
         openai.beta.threads.messages.create(
             thread_id=thread_id, role="user", content=user_text)
 
-    # 6️⃣ Run assistant
+    # 6) Run assistant (file_search enforced)
     run = openai.beta.threads.runs.create(
         assistant_id=assistant_id,
         thread_id=thread_id,
@@ -289,27 +329,53 @@ async def handle_activity(turn_context: TurnContext):
         run = openai.beta.threads.runs.retrieve(
             thread_id=thread_id, run_id=run.id)
 
-    # 7️⃣ Get reply
+    # 7) Get reply
     msgs = openai.beta.threads.messages.list(
         thread_id=thread_id, order="desc", limit=5)
     reply = next(
         (m.content[0].text.value for m in msgs.data if m.role == "assistant"), None)
 
-    # 8️⃣ Clarify handling
+    # 8) Clarify handling (JSON preferred)
+    q_json, opts_json = _extract_clarify_from_reply(reply or "")
+    if q_json:
+        awaiting_clarification.add(user_id)
+        actions = _clarify_actions(q_json, opts_json) if opts_json else None
+        await turn_context.send_activity(Activity(
+            type="message",
+            text=q_json,
+            suggested_actions=SuggestedActions(
+                actions=actions) if actions else None
+        ))
+        return
+
+    # Fallback to prefix/heuristic clarify
     if reply and (_is_clarify(reply) or _looks_like_clarify(reply)):
         question = _strip_clarify(reply)
         awaiting_clarification.add(user_id)
         await turn_context.send_activity(Activity(
             type="message",
-            text=question,
-            suggested_actions=SuggestedActions(
-                actions=_clarify_actions(question))
+            text=question
         ))
         return
 
-    # 9️⃣ Post-answer ambiguity check
-    if reply and _needs_followup_clarify(user_text, reply):
-        question = "To provide the most accurate document-based answer, could you clarify the model or configuration?"
+    # 9) Post-answer ambiguity check (research done → still ambiguous? ask CLARIFY)
+    if reply and _needs_followup_clarify(a.text or "", reply):
+        # Try JSON again if assistant embedded clarify object
+        q_json2, opts_json2 = _extract_clarify_from_reply(reply)
+        if q_json2:
+            awaiting_clarification.add(user_id)
+            actions = _clarify_actions(
+                q_json2, opts_json2) if opts_json2 else None
+            await turn_context.send_activity(Activity(
+                type="message",
+                text=q_json2,
+                suggested_actions=SuggestedActions(
+                    actions=actions) if actions else None
+            ))
+            return
+        # Otherwise heuristic question with minimal options
+        question = ("To provide the most accurate document-based answer, "
+                    "could you clarify the model/configuration or the relevant test/cert reference?")
         awaiting_clarification.add(user_id)
         await turn_context.send_activity(Activity(
             type="message",
@@ -319,6 +385,7 @@ async def handle_activity(turn_context: TurnContext):
         ))
         return
 
+    # 10) Send final
     await turn_context.send_activity(reply or "❌ No response from assistant.")
 
 # ─────────────────────────  FLASK ROUTES  ────────────────────────────────────
@@ -369,13 +436,11 @@ def health():
 
 # ─────────────────────────  MAIN  ────────────────────────────────────────────
 if __name__ == "__main__":
-    logging.info("🚀 Bot is starting on Render...")
-    logging.info("🔧 Environment check:")
+    logging.info("🚀 Bot is starting...")
     logging.info("  MicrosoftAppId: %s", "SET" if APP_ID else "MISSING")
     logging.info("  Azure OpenAI Endpoint: %s", AZURE_OPENAI_EP or "MISSING")
     logging.info("  OAuth Connection: %s", OAUTH_CONNECTION or "MISSING")
     logging.info("  Direct Line Secret: %s",
                  "SET" if DIRECT_LINE_SECRET else "MISSING")
     logging.info("  Admin Secret: %s", "SET" if ADMIN_SECRET else "NOT SET")
-
     app.run(host="0.0.0.0", port=3978)
