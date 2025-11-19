@@ -501,10 +501,6 @@ async def handle_activity(turn_context: TurnContext):
         )
         return
 
-    # -------------------- 14. Ensure source --------------------
-    if "source:" not in reply.lower():
-        reply = f"{reply}\n\nSource: Not specified in documents."
-
     # -------------------- 15. SEND FINAL REPLY --------------------
     await turn_context.send_activity(reply)
 
